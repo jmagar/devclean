@@ -41,7 +41,7 @@ advisory and cannot authorize cleanup.
 The comprehensive harness provides consistent local and CI profiles:
 
 ```sh
-python3 scripts/test-harness.py --profile fast    # format, Clippy, debug tests
+python3 scripts/test-harness.py --profile fast    # harness, format, Clippy, debug tests
 python3 scripts/test-harness.py --profile full    # fast + release + dependency policy
 python3 scripts/test-harness.py --profile stress  # ignored scale qualifications
 python3 scripts/test-harness.py --profile smoke   # disposable read-only CLI fixture
@@ -57,6 +57,7 @@ that redacted output cannot authorize cleanup.
 The equivalent checks remain available directly:
 
 ```sh
+python3 -m unittest discover -s scripts -p 'test_test_harness.py'
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
