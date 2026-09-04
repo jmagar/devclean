@@ -162,30 +162,40 @@ def run_captured(
     try:
         stdout, stderr = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired as error:
+        stdout, stderr = terminate_process_group(process)
+        raise subprocess.TimeoutExpired(command, timeout, stdout, stderr) from error
+    except KeyboardInterrupt:
+        terminate_process_group(process)
+        raise
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+
+
+def terminate_process_group(
+    process: subprocess.Popen[str],
+) -> tuple[str, str | None]:
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        stdout, stderr = process.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
         try:
-            os.killpg(process.pid, signal.SIGTERM)
+            os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
+        stdout, stderr = process.communicate()
+    else:
         try:
-            stdout, stderr = process.communicate(timeout=5)
-        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            pass
+        else:
             try:
                 os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-            stdout, stderr = process.communicate()
-        else:
-            try:
-                os.killpg(process.pid, 0)
-            except ProcessLookupError:
-                pass
-            else:
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-        raise subprocess.TimeoutExpired(command, timeout, stdout, stderr) from error
-    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+    return stdout, stderr
 
 
 def run_step(step: Step, run_dir: pathlib.Path) -> Result:

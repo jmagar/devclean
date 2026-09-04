@@ -22,6 +22,18 @@ SPEC.loader.exec_module(HARNESS)
 
 
 class HarnessContractTests(unittest.TestCase):
+    def test_keyboard_interrupt_terminates_and_reaps_process_group(self) -> None:
+        process = mock.Mock(pid=43210)
+        process.communicate.side_effect = [KeyboardInterrupt, ("stdout", "stderr")]
+        with (
+            mock.patch.object(HARNESS.subprocess, "Popen", return_value=process),
+            mock.patch.object(HARNESS.os, "killpg") as kill_group,
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            HARNESS.run_captured(["cargo", "test"], timeout=10)
+        kill_group.assert_any_call(process.pid, HARNESS.signal.SIGTERM)
+        self.assertEqual(process.communicate.call_count, 2)
+
     def test_timeout_terminates_descendant_processes(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             marker = pathlib.Path(raw) / "orphan-ran"
