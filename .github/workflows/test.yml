@@ -1,0 +1,46 @@
+name: Test
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Test profile
+        type: choice
+        options: [fast, full, stress, smoke, all]
+        default: full
+permissions:
+  contents: read
+concurrency:
+  group: test-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  test:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
+        with:
+          toolchain: 1.98.0
+          components: rustfmt, clippy
+      - uses: taiki-e/install-action@a7f328f5f617d9f65480d92a00ba2cf88ef0b191 # cargo-deny
+        with:
+          tool: cargo-deny
+      - name: Run selected harness profile
+        if: github.event_name == 'workflow_dispatch'
+        run: python3 scripts/test-harness.py --profile "${{ inputs.profile }}"
+      - name: Run required full profile
+        if: github.event_name != 'workflow_dispatch'
+        run: python3 scripts/test-harness.py --profile full
+      - name: Run required smoke profile
+        if: ${{ !cancelled() && github.event_name != 'workflow_dispatch' }}
+        run: python3 scripts/test-harness.py --profile smoke
+      - name: Upload test evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: test-harness-${{ github.run_id }}
+          path: artifacts/test-harness
+          if-no-files-found: warn
