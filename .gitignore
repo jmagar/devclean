@@ -1,0 +1,11 @@
+/target/
+/.qualification/
+/.lavra/
+/.beads/
+
+# Machine-specific qualification inputs and evidence.
+/docs/acceptance/macos-qualification.toml
+/docs/acceptance/macos-docker-qualification.toml
+/docs/acceptance/macos-filesystem-git-qualification.toml
+/docs/acceptance/macos-read-only.md
+
