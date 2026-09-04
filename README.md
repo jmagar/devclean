@@ -38,6 +38,24 @@ advisory and cannot authorize cleanup.
 
 ## Development
 
+The comprehensive harness provides consistent local and CI profiles:
+
+```sh
+python3 scripts/test-harness.py --profile fast    # format, Clippy, debug tests
+python3 scripts/test-harness.py --profile full    # fast + release + dependency policy
+python3 scripts/test-harness.py --profile stress  # ignored scale qualifications
+python3 scripts/test-harness.py --profile smoke   # disposable read-only CLI fixture
+python3 scripts/test-harness.py --profile all     # complete qualification
+```
+
+Each run writes per-step logs, `summary.json`, and `junit.xml` beneath
+`artifacts/test-harness/`. Use `--fail-fast` to stop at the first failure or
+`--list` to inspect a profile. The smoke profile operates only on a temporary
+fixture, verifies the fixture remains byte-for-byte unchanged, and confirms
+that redacted output cannot authorize cleanup.
+
+The equivalent checks remain available directly:
+
 ```sh
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
