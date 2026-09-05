@@ -14,6 +14,7 @@ camino.workspace = true
 devclean = { path = "../devclean" }
 devclean-core = { path = "../devclean-core" }
 gpui = { version = "0.2.2", features = ["runtime_shaders"] }
+libc.workspace = true
 rfd = "0.15"
 serde.workspace = true
 toml.workspace = true

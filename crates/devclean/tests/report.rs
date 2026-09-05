@@ -266,7 +266,10 @@ fn redaction_and_terminal_output_sanitize_untrusted_protections_stably() {
     let mut b = Vec::new();
     write_redacted(&first, &mut a).unwrap();
     write_redacted(&second, &mut b).unwrap();
-    assert_eq!(a, b);
+    assert_ne!(
+        a, b,
+        "separate exports must not be correlatable by candidate id"
+    );
     let export = String::from_utf8(a).unwrap();
     assert!(export.contains("active"));
     assert!(!export.contains("secret"));

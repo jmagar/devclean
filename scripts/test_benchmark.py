@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import pathlib
+import os
 import sys
 import tempfile
 import unittest
@@ -46,6 +47,30 @@ class BenchmarkContractTests(unittest.TestCase):
         self.assertAlmostEqual(comparison["wall_change_percent"], -20)
         self.assertAlmostEqual(comparison["throughput_change_percent"], 25)
         self.assertAlmostEqual(comparison["spool_change_percent"], -50)
+
+    def test_comparison_rejects_zero_throughput_baseline(self) -> None:
+        current = {
+            "median_wall_seconds": 1,
+            "entries_per_second": 1,
+            "observation_spool_bytes": 0,
+        }
+        baseline = dict(current, entries_per_second=0)
+        with self.assertRaisesRegex(ValueError, "throughput"):
+            BENCHMARK.compare(current, baseline)
+
+    def test_private_outputs_and_minimized_config(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            base = pathlib.Path(raw)
+            source = base / "source.toml"
+            source.write_text(
+                'approved_roots=["/tmp/project"]\napproved_caches=[]\n'
+                'exclusions=[]\n[presentation]\nterminal_rows=4\n',
+                encoding="utf-8",
+            )
+            destination = base / "benchmark.toml"
+            BENCHMARK.write_private(destination, BENCHMARK.minimized_config(source))
+            self.assertEqual(os.stat(destination).st_mode & 0o777, 0o600)
+            self.assertNotIn("source.toml", destination.read_text(encoding="utf-8"))
 
     def test_percentile_interpolates_and_rejects_empty_samples(self) -> None:
         self.assertEqual(BENCHMARK.percentile([1, 2, 3], 0.5), 2)

@@ -64,6 +64,11 @@ devclean scan CONFIG STORE SCAN_ID
 devclean report STORE SCAN_ID
 devclean report export --redacted STORE SCAN_ID
 devclean explain STORE SCAN_ID CANDIDATE_ID
+devclean report latest STORE
+devclean config add-root STORE PATH
+devclean config remove-root STORE PATH
+devclean config import --approve STORE CONFIG
+devclean app-context [STORE]
 ```
 
 A scan configuration explicitly approves project roots, cache roots,
@@ -80,7 +85,13 @@ only its own size estimates, not estimates for complete siblings. The preset
 intentionally does not approve stateful roots such as all of `~/.rustup` or
 `~/.local/share`. Approved cache roots are emitted as top-level candidates so
 their complete recursive size is visible even when their children have
-tool-specific names. When `STORE` is omitted, it defaults to `~/.devclean`.
+tool-specific names. When `STORE` is omitted, it defaults to
+`~/Library/Application Support/devclean`, shared with the desktop app.
+
+The configuration commands expose the desktop app's canonical scope operations
+to scripts and agents. `app-context` prints JSON containing the active store,
+configuration, approved roots and caches, report IDs, latest report, and tier
+vocabulary; `report latest` renders the newest valid full report.
 
 Project discovery is best-effort and records its inspected, included, skipped,
 and truncated counts in the generated configuration. It searches only the
@@ -168,7 +179,7 @@ python3 scripts/benchmark.py --profile quick
 python3 scripts/benchmark.py --profile full
 python3 scripts/benchmark.py --profile full --root-count 4
 python3 scripts/benchmark.py --root ~/.cargo/registry --samples 5
-python3 scripts/benchmark.py --config ~/.devclean/config.toml --samples 3
+python3 scripts/benchmark.py --config "$HOME/Library/Application Support/devclean/config.toml" --samples 3
 ```
 
 Compare a run with a saved result, optionally failing when median wall time

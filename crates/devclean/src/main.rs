@@ -12,10 +12,10 @@ use devclean::inventory::{
 use devclean::metadata::{MetadataFormat, MetadataReader, MetadataRequest, MetadataStatus};
 use devclean::private_store::PrivateStore;
 use devclean::report::{ReportStore, render_explanation, render_summary, write_redacted};
-use devclean::scan::{TraversalCoverage, TraversalOptions, stream_observations};
+use devclean::scan::{TraversalCoverage, TraversalOptions};
 use devclean_core::{
-    ActivityIndex, CoverageStatus, DiagnosticAggregator, Observation, PermitKind,
-    ResourceFingerprint, ResourceIdentity, ScopePolicy, WorkPool,
+    ActivityIndex, CoverageStatus, Observation, PermitKind, ResourceFingerprint, ResourceIdentity,
+    ScopePolicy, WorkPool,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::CString;
@@ -43,6 +43,7 @@ fn run(args: Vec<String>) -> i32 {
 
 #[derive(Debug, Eq, PartialEq)]
 enum CliCommand {
+    ProtocolVersion,
     Init {
         store: String,
         macos: bool,
@@ -65,9 +66,27 @@ enum CliCommand {
         scan_id: String,
         candidate: devclean_core::LogicalCandidateId,
     },
+    ConfigAddRoot {
+        store: String,
+        path: String,
+    },
+    ConfigRemoveRoot {
+        store: String,
+        path: String,
+    },
+    ConfigImport {
+        store: String,
+        path: String,
+    },
+    ReportLatest {
+        store: String,
+    },
+    AppContext {
+        store: String,
+    },
 }
 
-const USAGE: &str = "usage: devclean init STORE | init --macos [STORE] | scan CONFIG STORE SCAN_ID | report STORE SCAN_ID | report export --redacted STORE SCAN_ID | explain STORE SCAN_ID CANDIDATE_ID";
+const USAGE: &str = "usage: devclean protocol-version | init STORE | init --macos [STORE] | scan CONFIG STORE SCAN_ID | report STORE SCAN_ID | report latest STORE | report export --redacted STORE SCAN_ID | explain STORE SCAN_ID CANDIDATE_ID | config add-root STORE PATH | config remove-root STORE PATH | config import --approve STORE PATH | app-context [STORE]";
 
 fn parse_command(args: &[String]) -> Result<CliCommand, (ExitCode, String)> {
     let invalid = || (ExitCode::ConfigInvalid, USAGE.into());
@@ -77,6 +96,7 @@ fn parse_command(args: &[String]) -> Result<CliCommand, (ExitCode, String)> {
         .collect::<Vec<_>>()
         .as_slice()
     {
+        ["protocol-version"] => Ok(CliCommand::ProtocolVersion),
         ["init", "--macos"] => Ok(CliCommand::Init {
             store: default_macos_store().map_err(|message| (ExitCode::ConfigInvalid, message))?,
             macos: true,
@@ -94,11 +114,14 @@ fn parse_command(args: &[String]) -> Result<CliCommand, (ExitCode, String)> {
             store: (*store).into(),
             scan_id: (*scan_id).into(),
         }),
-        ["report", store, scan_id] => Ok(CliCommand::Report {
+        ["report", "latest", store] => Ok(CliCommand::ReportLatest {
+            store: (*store).into(),
+        }),
+        ["report", "export", "--redacted", store, scan_id] => Ok(CliCommand::ExportRedacted {
             store: (*store).into(),
             scan_id: (*scan_id).into(),
         }),
-        ["report", "export", "--redacted", store, scan_id] => Ok(CliCommand::ExportRedacted {
+        ["report", store, scan_id] => Ok(CliCommand::Report {
             store: (*store).into(),
             scan_id: (*scan_id).into(),
         }),
@@ -110,6 +133,24 @@ fn parse_command(args: &[String]) -> Result<CliCommand, (ExitCode, String)> {
                     .map_err(|_| (ExitCode::ConfigInvalid, "invalid candidate id".into()))?,
             ),
         }),
+        ["config", "add-root", store, path] => Ok(CliCommand::ConfigAddRoot {
+            store: (*store).into(),
+            path: (*path).into(),
+        }),
+        ["config", "remove-root", store, path] => Ok(CliCommand::ConfigRemoveRoot {
+            store: (*store).into(),
+            path: (*path).into(),
+        }),
+        ["config", "import", "--approve", store, path] => Ok(CliCommand::ConfigImport {
+            store: (*store).into(),
+            path: (*path).into(),
+        }),
+        ["app-context"] => Ok(CliCommand::AppContext {
+            store: default_macos_store().map_err(|message| (ExitCode::ConfigInvalid, message))?,
+        }),
+        ["app-context", store] => Ok(CliCommand::AppContext {
+            store: (*store).into(),
+        }),
         _ => Err(invalid()),
     }
 }
@@ -117,7 +158,10 @@ fn parse_command(args: &[String]) -> Result<CliCommand, (ExitCode, String)> {
 fn default_macos_store() -> Result<String, String> {
     let home = std::env::var_os("HOME").ok_or("HOME is not set")?;
     Utf8PathBuf::from_path_buf(home.into())
-        .map(|home| home.join(".devclean").to_string())
+        .map(|home| {
+            home.join("Library/Application Support/devclean")
+                .to_string()
+        })
         .map_err(|_| "HOME must be UTF-8".into())
 }
 
@@ -126,6 +170,10 @@ fn execute(command: CliCommand) -> Result<ExitCode, (ExitCode, String)> {
     // conservative fixed number of candidate rows.
     const REPORT_TERMINAL_ROWS: usize = 20;
     match command {
+        CliCommand::ProtocolVersion => {
+            println!("1");
+            Ok(ExitCode::Complete)
+        }
         CliCommand::Init { store, macos } => handle_init(&store, macos),
         CliCommand::Scan {
             config,
@@ -141,6 +189,11 @@ fn execute(command: CliCommand) -> Result<ExitCode, (ExitCode, String)> {
             scan_id,
             candidate,
         } => handle_explain(&store, &scan_id, &candidate),
+        CliCommand::ConfigAddRoot { store, path } => handle_config_add_root(&store, &path),
+        CliCommand::ConfigRemoveRoot { store, path } => handle_config_remove_root(&store, &path),
+        CliCommand::ConfigImport { store, path } => handle_config_import(&store, &path),
+        CliCommand::ReportLatest { store } => handle_report_latest(&store, REPORT_TERMINAL_ROWS),
+        CliCommand::AppContext { store } => handle_app_context(&store),
     }
 }
 
@@ -361,6 +414,111 @@ fn handle_explain(
     println!("{}", render_explanation(&value));
     Ok(ExitCode::Complete)
 }
+
+fn load_store_config(store: &str) -> Result<(PrivateStore, Config), (ExitCode, String)> {
+    let store = PrivateStore::create(&Utf8PathBuf::from(store)).map_err(internal)?;
+    let bytes = store
+        .read_if_exists("config.toml", 1024 * 1024)
+        .map_err(internal)?
+        .ok_or((
+            ExitCode::ConfigInvalid,
+            "config.toml not found in store".into(),
+        ))?;
+    let source = std::str::from_utf8(&bytes)
+        .map_err(|_| (ExitCode::ConfigInvalid, "config is not UTF-8".into()))?;
+    let config = Config::parse(source).map_err(config_error)?;
+    Ok((store, config))
+}
+
+fn save_store_config(store: &PrivateStore, config: &Config) -> Result<(), (ExitCode, String)> {
+    let source = toml::to_string_pretty(config).map_err(config_error)?;
+    store
+        .replace_atomic("config.toml", |file| {
+            std::io::Write::write_all(file, source.as_bytes())?;
+            Ok(())
+        })
+        .map_err(internal)?;
+    Ok(())
+}
+
+fn handle_config_add_root(store: &str, path: &str) -> Result<ExitCode, (ExitCode, String)> {
+    let (private, mut config) = load_store_config(store)?;
+    let canonical = std::fs::canonicalize(path).map_err(config_error)?;
+    let canonical = Utf8PathBuf::from_path_buf(canonical)
+        .map_err(|_| (ExitCode::ConfigInvalid, "root path is not UTF-8".into()))?;
+    config.approved_roots.insert(canonical);
+    config.authorized_traversal_scope().map_err(config_error)?;
+    save_store_config(&private, &config)?;
+    println!("{}", serde_json::to_string(&config).map_err(internal)?);
+    Ok(ExitCode::Complete)
+}
+
+fn handle_config_remove_root(store: &str, path: &str) -> Result<ExitCode, (ExitCode, String)> {
+    let (private, mut config) = load_store_config(store)?;
+    if !config.approved_roots.remove(camino::Utf8Path::new(path)) {
+        return Err((ExitCode::ConfigInvalid, "approved root not found".into()));
+    }
+    save_store_config(&private, &config)?;
+    println!("{}", serde_json::to_string(&config).map_err(internal)?);
+    Ok(ExitCode::Complete)
+}
+
+fn handle_config_import(store: &str, path: &str) -> Result<ExitCode, (ExitCode, String)> {
+    let bytes = read_config(path)?;
+    let source = std::str::from_utf8(&bytes)
+        .map_err(|_| (ExitCode::ConfigInvalid, "config is not UTF-8".into()))?;
+    let config = Config::import_proposed(source, true).map_err(config_error)?;
+    config.authorized_traversal_scope().map_err(config_error)?;
+    config.approved_docker().map_err(config_error)?;
+    let private = PrivateStore::create(&Utf8PathBuf::from(store)).map_err(internal)?;
+    save_store_config(&private, &config)?;
+    println!("{}", serde_json::to_string(&config).map_err(internal)?);
+    Ok(ExitCode::Complete)
+}
+
+fn full_report_ids(store: &str) -> Result<Vec<String>, (ExitCode, String)> {
+    reports(store)?.valid_report_ids().map_err(internal)
+}
+
+fn handle_report_latest(store: &str, terminal_rows: usize) -> Result<ExitCode, (ExitCode, String)> {
+    let ids = full_report_ids(store)?;
+    let report_store = reports(store)?;
+    for id in ids.iter().rev() {
+        if let Ok(report) = report_store.read(id) {
+            print!(
+                "{}",
+                render_summary(&report, terminal_rows, std::io::stdout().is_terminal())
+            );
+            return Ok(if report.coverage == CoverageStatus::Complete {
+                ExitCode::Complete
+            } else {
+                ExitCode::Incomplete
+            });
+        }
+    }
+    Err((ExitCode::ConfigInvalid, "no valid reports found".into()))
+}
+
+fn handle_app_context(store: &str) -> Result<ExitCode, (ExitCode, String)> {
+    let (_, config) = load_store_config(store)?;
+    let reports = full_report_ids(store)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "store": store,
+            "config": Utf8PathBuf::from(store).join("config.toml"),
+            "approved_roots": config.approved_roots,
+            "approved_caches": config.approved_caches,
+            "reports": reports,
+            "latest_report": reports.last(),
+            "tiers": ["safe", "review", "protected", "unknown"],
+        }))
+        .map_err(internal)?
+    );
+    Ok(ExitCode::Complete)
+}
+
 fn reports(path: &str) -> Result<ReportStore, (ExitCode, String)> {
     Ok(ReportStore::new(
         PrivateStore::create(&Utf8PathBuf::from(path)).map_err(internal)?,
@@ -757,7 +915,6 @@ fn scan(
                     emit(value);
                 },
             );
-            let mut diagnostics = DiagnosticAggregator::new(1000, 3);
             let mut traversal_coverage = TraversalCoverage::Complete;
             let mut incomplete_roots = BTreeSet::new();
             for outcome in parallel_outcomes {
@@ -810,183 +967,6 @@ fn scan(
                     "{{\"event\":\"scan_limit\",\"remaining_roots\":0,\"reason\":\"observation_budget\"}}"
                 );
             }
-            if options.before_metadata.is_some() {
-            let mut work_budget = ScanWorkBudget::from_started(
-                options.max_observations,
-                overall_started,
-                max_elapsed,
-            );
-            for (index, root) in roots.iter().enumerate() {
-                if let Some(reason) = work_budget.exhausted_reason() {
-                    incomplete_roots.extend(roots[index..].iter().cloned());
-                    traversal_coverage = TraversalCoverage::Partial;
-                    eprintln!(
-                        "{{\"event\":\"scan_limit\",\"remaining_roots\":{},\"reason\":\"{}\"}}",
-                        roots.len() - index,
-                        reason
-                    );
-                    break;
-                }
-                eprintln!(
-                    "{{\"event\":\"root_start\",\"index\":{},\"total\":{},\"root\":{}}}",
-                    index + 1,
-                    roots.len(),
-                    serde_json::to_string(root.as_str()).unwrap_or_else(|_| "\"invalid\"".into())
-                );
-                let started = Instant::now();
-                let mut root_options = options.clone();
-                root_options.max_observations = work_budget.remaining_observations;
-                root_options.deadline = Some(work_budget.deadline());
-                let progress_root = root.clone();
-                root_options.progress = Some(Arc::new(move |entries, queue_high_water| {
-                    eprintln!(
-                        "{{\"event\":\"root_progress\",\"root\":{},\"entries\":{},\"queue_high_water\":{}}}",
-                        serde_json::to_string(progress_root.as_str())
-                            .unwrap_or_else(|_| "\"invalid\"".into()),
-                        entries,
-                        queue_high_water
-                    );
-                }));
-                let traversal = stream_observations(
-                    std::slice::from_ref(root),
-                    &root_options,
-                    &mut diagnostics,
-                    |mut value| {
-                        if let devclean_core::ResourceIdentity::Filesystem { path } =
-                            &value.identity
-                        {
-                            if path.file_name() == Some(".git") {
-                                let discovered =
-                                    path.parent().map(|root| git_key(root, &git_approved_roots));
-                                if matches!(discovered, Some(Err(()))) {
-                                    external_coverage.join_assign(&CoverageStatus::Partial);
-                                }
-                                if let Some(Ok(Some(key))) = discovered {
-                                    if !emitted_git.insert(key.clone()) {
-                                        emit(value);
-                                        return;
-                                    }
-                                    let inventory = git_cache.get_or_collect(
-                                        key.clone(),
-                                        &mut git_backend,
-                                        limits,
-                                        &options.pool,
-                                        &cancellation,
-                                    );
-                                    merge_coverage(&mut external_coverage, &inventory.coverage);
-                                    for observation in
-                                        git_observations(&key, inventory, &probe_status, &roots)
-                                    {
-                                        emit(observation);
-                                    }
-                                }
-                            }
-                            if path.starts_with(root)
-                                && CatalogDetector::is_filesystem_candidate(path)
-                            {
-                                value
-                                    .attributes
-                                    .insert("probe_approved_scope".into(), "complete".into());
-                                value.attributes.insert(
-                                    "probe_activity".into(),
-                                    coverage_name(&probe_status).into(),
-                                );
-                                value.attributes.insert(
-                                    "probe_open_files".into(),
-                                    coverage_name(&probe_status).into(),
-                                );
-                                if let Some((owner, markers, coverage)) = project_metadata_for(
-                                    path,
-                                    root,
-                                    &metadata_reader,
-                                    &mut metadata_cache,
-                                )
-                                {
-                                    value
-                                        .attributes
-                                        .insert("project_owner".into(), owner.to_string());
-                                    value.attributes.insert("markers".into(), markers);
-                                    value
-                                        .attributes
-                                        .insert("metadata_coverage".into(), coverage.into());
-                                    value
-                                        .attributes
-                                        .insert("probe_metadata".into(), coverage.into());
-                                }
-                                if path
-                                    .ancestors()
-                                    .any(|ancestor| approved_caches.contains(ancestor))
-                                {
-                                    value.attributes.insert("known_cache".into(), "true".into());
-                                }
-                                if approved_caches.contains(path) {
-                                    value
-                                        .attributes
-                                        .insert("approved_cache_root".into(), "true".into());
-                                }
-                                if value.attributes.get("known_cache").map(String::as_str)
-                                    == Some("true")
-                                    || (!value
-                                        .attributes
-                                        .get("markers")
-                                        .is_none_or(String::is_empty)
-                                        && value
-                                            .attributes
-                                            .get("metadata_coverage")
-                                            .map(String::as_str)
-                                            == Some("complete"))
-                                {
-                                    value
-                                        .attributes
-                                        .insert("probe_rebuildability".into(), "complete".into());
-                                }
-                                if activity
-                                    .as_ref()
-                                    .is_some_and(|snapshot| snapshot.index.matches_prefix(path))
-                                {
-                                    value.attributes.insert("active".into(), "true".into());
-                                    value.attributes.insert("open".into(), "true".into());
-                                }
-                            }
-                        }
-                        emit(value);
-                    },
-                );
-                work_budget.consume(traversal.metrics.entries_seen);
-                let root_diagnostics = diagnostics
-                    .groups()
-                    .iter()
-                    .filter(|(key, _)| key.root == root.as_str())
-                    .map(|(key, summary)| format!("{}={}", key.reason, summary.count))
-                    .collect::<Vec<_>>()
-                    .join(",");
-                eprintln!(
-                    "{{\"event\":\"root_finish\",\"index\":{},\"total\":{},\"root\":{},\"entries\":{},\"metadata_reads\":{},\"queue_high_water\":{},\"elapsed_seconds\":{:.3},\"coverage\":{},\"remaining_observations\":{},\"diagnostics\":{}}}",
-                    index + 1,
-                    roots.len(),
-                    serde_json::to_string(root.as_str()).unwrap_or_else(|_| "\"invalid\"".into()),
-                    traversal.metrics.entries_seen,
-                    traversal.metrics.metadata_reads,
-                    traversal.metrics.queue_high_water,
-                    started.elapsed().as_secs_f64(),
-                    serde_json::to_string(traversal_coverage_name(traversal.coverage)).unwrap(),
-                    work_budget.remaining_observations,
-                    serde_json::to_string(&root_diagnostics).unwrap()
-                );
-                if traversal.coverage != TraversalCoverage::Complete {
-                    incomplete_roots.insert(root.clone());
-                    traversal_coverage = match traversal.coverage {
-                        TraversalCoverage::Cancelled => TraversalCoverage::Cancelled,
-                        TraversalCoverage::Partial
-                            if traversal_coverage != TraversalCoverage::Cancelled =>
-                        {
-                            TraversalCoverage::Partial
-                        }
-                        _ => traversal_coverage,
-                    };
-                }
-            }
-            }
             ProducerOutcome {
                 coverage: producer_coverage(
                     traversal_coverage,
@@ -1035,45 +1015,6 @@ fn traversal_coverage_name(value: TraversalCoverage) -> &'static str {
         TraversalCoverage::Complete => "complete",
         TraversalCoverage::Partial => "partial",
         TraversalCoverage::Cancelled => "cancelled",
-    }
-}
-
-struct ScanWorkBudget {
-    remaining_observations: u64,
-    started: Instant,
-    max_elapsed: Duration,
-}
-
-impl ScanWorkBudget {
-    #[cfg(test)]
-    fn new(max_observations: u64, max_elapsed: Duration) -> Self {
-        Self::from_started(max_observations, Instant::now(), max_elapsed)
-    }
-
-    fn from_started(max_observations: u64, started: Instant, max_elapsed: Duration) -> Self {
-        Self {
-            remaining_observations: max_observations,
-            started,
-            max_elapsed,
-        }
-    }
-
-    fn consume(&mut self, observations: u64) {
-        self.remaining_observations = self.remaining_observations.saturating_sub(observations);
-    }
-
-    fn deadline(&self) -> Instant {
-        self.started + self.max_elapsed
-    }
-
-    fn exhausted_reason(&self) -> Option<&'static str> {
-        if self.remaining_observations == 0 {
-            Some("observation_budget")
-        } else if self.started.elapsed() >= self.max_elapsed {
-            Some("elapsed_budget")
-        } else {
-            None
-        }
     }
 }
 
@@ -1548,8 +1489,14 @@ mod discovery_tests {
             args(&["init", "--macos", "store"]),
             args(&["scan", "config", "store", "scan"]),
             args(&["report", "store", "scan"]),
+            args(&["report", "latest", "store"]),
             args(&["report", "export", "--redacted", "store", "scan"]),
             args(&["explain", "store", "scan", candidate]),
+            args(&["config", "add-root", "store", "path"]),
+            args(&["config", "remove-root", "store", "path"]),
+            args(&["config", "import", "--approve", "store", "config"]),
+            args(&["app-context"]),
+            args(&["app-context", "store"]),
         ];
         for values in valid {
             assert!(parse_command(&values).is_ok(), "{values:?}");
@@ -1568,6 +1515,8 @@ mod discovery_tests {
             args(&["export", "store", "scan"]),
             args(&["explain", "store", "scan"]),
             args(&["explain", "store", "scan", "not-a-uuid"]),
+            args(&["config", "import", "store", "config"]),
+            args(&["app-context", "store", "extra"]),
             args(&["unknown"]),
         ];
         for values in invalid {
@@ -1656,17 +1605,6 @@ mod discovery_tests {
         assert_eq!(metadata.1, "Cargo.toml");
         assert_eq!(metadata.2, "complete");
         assert_eq!(cache.len(), 1);
-    }
-
-    #[test]
-    fn scan_work_budget_is_global_across_roots_and_time_bounded() {
-        let mut budget = ScanWorkBudget::new(5, Duration::from_secs(60));
-        budget.consume(2);
-        budget.consume(3);
-        assert_eq!(budget.exhausted_reason(), Some("observation_budget"));
-
-        let elapsed = ScanWorkBudget::new(5, Duration::ZERO);
-        assert_eq!(elapsed.exhausted_reason(), Some("elapsed_budget"));
     }
 
     #[test]

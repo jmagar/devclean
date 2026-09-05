@@ -10,13 +10,86 @@ fn macos_init_without_store_uses_home_default() {
 
     let temp = tempfile::tempdir_in(std::env::var("HOME").unwrap()).unwrap();
     std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::create_dir_all(temp.path().join("Library/Application Support")).unwrap();
     let result = command()
         .args(["init", "--macos"])
         .env("HOME", temp.path())
         .output()
         .unwrap();
     assert_eq!(result.status.code(), Some(0), "{:?}", result.stderr);
-    assert!(temp.path().join(".devclean/config.toml").is_file());
+    assert!(
+        temp.path()
+            .join("Library/Application Support/devclean/config.toml")
+            .is_file()
+    );
+}
+
+#[test]
+fn cli_configuration_actions_share_agent_visible_app_context() {
+    let temp = tempfile::tempdir().unwrap();
+    let canonical = std::fs::canonicalize(temp.path()).unwrap();
+    let store = canonical.join("store");
+    let root = canonical.join("project");
+    std::fs::create_dir(&root).unwrap();
+    assert_eq!(
+        command()
+            .args(["init", store.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .code(),
+        Some(0)
+    );
+    let add = command()
+        .args([
+            "config",
+            "add-root",
+            store.to_str().unwrap(),
+            root.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(add.status.code(), Some(0), "{:?}", add.stderr);
+    let scan = command()
+        .args([
+            "scan",
+            store.join("config.toml").to_str().unwrap(),
+            store.to_str().unwrap(),
+            "scan-123",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        matches!(scan.status.code(), Some(0 | 2)),
+        "{:?}",
+        scan.stderr
+    );
+    let latest = command()
+        .args(["report", "latest", store.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(matches!(latest.status.code(), Some(0 | 2)));
+    let context = command()
+        .args(["app-context", store.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(context.status.code(), Some(0));
+    let context: serde_json::Value = serde_json::from_slice(&context.stdout).unwrap();
+    assert_eq!(context["approved_roots"][0], root.to_str().unwrap());
+    assert_eq!(context["latest_report"], "scan-123");
+
+    assert_eq!(
+        command()
+            .args([
+                "config",
+                "remove-root",
+                store.to_str().unwrap(),
+                root.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap()
+            .code(),
+        Some(0)
+    );
 }
 
 #[test]

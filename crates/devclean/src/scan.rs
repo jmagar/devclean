@@ -334,12 +334,10 @@ pub fn stream_observations(
                         continue;
                     }
                 };
-                // Hooks are used by race-injection tests, where every entry
-                // must be re-authorized immediately. Normal traversal validates
-                // the containing directory before and after enumeration.
-                if options.before_metadata.is_some()
-                    && let Some(scope) = &options.scope
-                {
+                // Re-authorize every observed entry after metadata collection.
+                // Containing-directory identity checks cannot retract an
+                // observation if an intermediate component is swapped first.
+                if let Some(scope) = &options.scope {
                     match scope.authorize(&path, metadata.dev()) {
                         ScopeDecision::Include => {}
                         ScopeDecision::Exclude => continue,

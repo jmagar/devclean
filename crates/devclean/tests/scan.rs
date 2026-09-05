@@ -108,6 +108,29 @@ fn performance_contract_parallel_roots_preserve_complete_independent_results() {
 }
 
 #[test]
+fn parallel_hook_visits_and_emits_each_entry_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = camino::Utf8Path::from_path(tmp.path())
+        .unwrap()
+        .join("root");
+    fs::create_dir(&root).unwrap();
+    for index in 0..12 {
+        fs::write(root.join(format!("entry-{index}")), b"x").unwrap();
+    }
+    let hook_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let calls = Arc::clone(&hook_calls);
+    let mut settings = options();
+    settings.before_metadata = Some(Arc::new(move |_| {
+        calls.fetch_add(1, Ordering::Relaxed);
+    }));
+    let mut emitted = 0;
+    let outcomes = stream_roots_parallel(&[root], &settings, 2, None, |_, _| emitted += 1);
+    assert_eq!(outcomes[0].traversal.metrics.entries_seen, 12);
+    assert_eq!(hook_calls.load(Ordering::Relaxed), 12);
+    assert_eq!(emitted, 12);
+}
+
+#[test]
 fn performance_contract_parallel_roots_share_one_observation_budget() {
     let tmp = tempfile::tempdir().unwrap();
     let base = camino::Utf8Path::from_path(tmp.path()).unwrap();

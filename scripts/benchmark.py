@@ -9,7 +9,6 @@ import hashlib
 import json
 import os
 import pathlib
-import platform
 import resource
 import shutil
 import statistics
@@ -85,11 +84,14 @@ def compare(current: dict[str, Any], baseline: dict[str, Any]) -> dict[str, floa
     baseline_wall = float(baseline["median_wall_seconds"])
     if baseline_wall <= 0:
         raise ValueError("baseline median must be positive")
+    baseline_throughput = float(baseline["entries_per_second"])
+    if baseline_throughput <= 0:
+        raise ValueError("baseline throughput must be positive")
     return {
         "wall_change_percent": (current_wall / baseline_wall - 1) * 100,
         "throughput_change_percent": (
             float(current["entries_per_second"])
-            / float(baseline["entries_per_second"])
+            / baseline_throughput
             - 1
         )
         * 100,
@@ -166,7 +168,9 @@ def run_sample(
     stderr_path = store.with_suffix(".stderr.log")
     before = resource.getrusage(resource.RUSAGE_CHILDREN)
     started = time.perf_counter()
-    with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
+    stdout_fd = os.open(stdout_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    stderr_fd = os.open(stderr_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(stdout_fd, "wb") as stdout, os.fdopen(stderr_fd, "wb") as stderr:
         completed = subprocess.run(
             [str(binary), "scan", str(config), str(store), "benchmark"],
             stdout=stdout,
@@ -197,8 +201,8 @@ def run_sample(
         "system_seconds": after.ru_stime - before.ru_stime,
         "exit_code": completed.returncode,
         "metrics": parse_metrics(report.stdout),
-        "stdout_log": str(stdout_path),
-        "stderr_log": str(stderr_path),
+        "stdout_log": stdout_path.name,
+        "stderr_log": stderr_path.name,
     }
 
 
@@ -214,6 +218,47 @@ def atomic_json(path: pathlib.Path, payload: dict[str, Any]) -> None:
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def write_private(path: pathlib.Path, text: str) -> None:
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+        output.write(text)
+        output.flush()
+        os.fsync(output.fileno())
+
+
+def minimized_config(source: pathlib.Path) -> str:
+    payload = tomllib.loads(source.read_text(encoding="utf-8"))
+    lines = [
+        f"approved_roots={json.dumps(payload.get('approved_roots', []))}",
+        f"approved_caches={json.dumps(payload.get('approved_caches', []))}",
+        f"exclusions={json.dumps(payload.get('exclusions', []))}",
+    ]
+    docker = payload.get("docker")
+    if docker:
+        lines.extend(
+            [
+                "[docker]",
+                f"context={json.dumps(docker['context'])}",
+                f"endpoint={json.dumps(docker['endpoint'])}",
+                f"engine_id={json.dumps(docker['engine_id'])}",
+            ]
+        )
+    presentation = payload.get("presentation", {})
+    lines.extend(
+        [
+            "[presentation]",
+            f"terminal_rows={int(presentation.get('terminal_rows', 0))}",
+        ]
+    )
+    limits = payload.get("limits", {})
+    if limits:
+        lines.append("[limits]")
+        for key in ("max_observations", "max_elapsed_seconds", "min_free_bytes"):
+            if key in limits:
+                lines.append(f"{key}={int(limits[key])}")
+    return "\n".join(lines) + "\n"
 
 
 def main() -> int:
@@ -248,6 +293,7 @@ def main() -> int:
     timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
     run_dir = args.output_dir.resolve() / f"{timestamp}-{args.profile}"
     run_dir.mkdir(parents=True, exist_ok=False)
+    run_dir.chmod(0o700)
     binary = (args.binary.resolve() if args.binary else build_binary())
     if not binary.is_file():
         raise FileNotFoundError(binary)
@@ -261,7 +307,7 @@ def main() -> int:
             parser.error("--config must approve at least one existing root")
         fixture_digests = None
         source = "existing-config"
-        shutil.copyfile(source_config, config)
+        write_private(config, minimized_config(source_config))
     elif args.root:
         scan_roots = [args.root.resolve(strict=True)]
         fixture_digests = None
@@ -278,12 +324,12 @@ def main() -> int:
         }
         source = "synthetic"
     if not args.config:
-        config.write_text(
+        write_private(
+            config,
             f"approved_roots={json.dumps([str(root) for root in scan_roots])}\n"
             "approved_caches=[]\nexclusions=[]\n[presentation]\nterminal_rows=0\n"
             "[limits]\nmax_observations=5000000\nmax_elapsed_seconds=900\n"
             "min_free_bytes=67108864\n",
-            encoding="utf-8",
         )
 
     for index in range(warmups):
@@ -304,13 +350,6 @@ def main() -> int:
         "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "profile": args.profile,
         "source": source,
-        "roots": [str(root) for root in scan_roots],
-        "binary": str(binary),
-        "host": {
-            "platform": platform.platform(),
-            "architecture": platform.machine(),
-            "python": platform.python_version(),
-        },
         "warmups": warmups,
         "samples": measured_samples,
         "aggregate": aggregate,
@@ -319,7 +358,7 @@ def main() -> int:
     if args.baseline:
         baseline_payload = json.loads(args.baseline.read_text(encoding="utf-8"))
         comparison = compare(aggregate, baseline_payload["aggregate"])
-        payload["baseline"] = str(args.baseline.resolve())
+        payload["baseline"] = args.baseline.name
         payload["comparison"] = comparison
         if args.max_regression_percent is not None:
             failed = comparison["wall_change_percent"] > args.max_regression_percent

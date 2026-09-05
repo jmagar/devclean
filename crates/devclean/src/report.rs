@@ -69,6 +69,33 @@ pub struct ReportStore {
     max_bytes: u64,
 }
 impl ReportStore {
+    pub fn latest_valid_report_id(&self) -> Result<Option<String>, ReportError> {
+        let mut ids = self
+            .store
+            .member_names()?
+            .into_iter()
+            .filter_map(|name| full_report_id(&name).map(str::to_owned))
+            .collect::<Vec<_>>();
+        ids.sort_unstable_by(|left, right| right.cmp(left));
+        for id in ids {
+            if self.stream_summary(&id).is_ok() {
+                return Ok(Some(id));
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn valid_report_ids(&self) -> Result<Vec<String>, ReportError> {
+        let mut ids = self
+            .store
+            .member_names()?
+            .into_iter()
+            .filter_map(|name| full_report_id(&name).map(str::to_owned))
+            .filter(|id| self.stream_summary(id).is_ok())
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        Ok(ids)
+    }
     pub fn temporary_store(&self) -> Result<(tempfile::TempDir, PrivateStore), ReportError> {
         self.store.temporary_child().map_err(ReportError::Store)
     }
@@ -240,6 +267,12 @@ impl ReportStore {
             }
         }
     }
+}
+
+pub fn full_report_id(name: &str) -> Option<&str> {
+    let id = name.strip_prefix("scan-")?.strip_suffix(".json")?;
+    (!id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()))
+        .then_some(name.strip_suffix(".json")?)
 }
 
 fn inspect_reader(
@@ -587,6 +620,7 @@ fn safe_terminal_bounded(value: &str, max_chars: usize) -> String {
 }
 
 pub fn write_redacted(report: &ScanReportV1, mut writer: impl Write) -> Result<(), ReportError> {
+    let export_salt = uuid::Uuid::new_v4();
     #[derive(Serialize)]
     struct Export<'a> {
         schema_version: u32,
@@ -607,8 +641,10 @@ pub fn write_redacted(report: &ScanReportV1, mut writer: impl Write) -> Result<(
         .map(|value| Redacted {
             id: format!(
                 "candidate-{}",
-                &blake3::hash(format!("devclean-redacted-v1\0{}", value.id.0).as_bytes()).to_hex()
-                    [..16]
+                &blake3::hash(
+                    format!("devclean-redacted-v2\0{export_salt}\0{}", value.id.0).as_bytes(),
+                )
+                .to_hex()[..16]
             ),
             tier: value.tier,
             protections: value

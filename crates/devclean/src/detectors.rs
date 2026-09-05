@@ -770,6 +770,9 @@ impl CatalogDetector {
         let ResourceIdentity::Filesystem { path } = &observation.identity else {
             unreachable!()
         };
+        if !Self::is_filesystem_candidate(path) {
+            return Ok(None);
+        }
         if let Some((family, marker)) = sharded_build(path) {
             let marker_present = observation
                 .attributes
@@ -889,6 +892,11 @@ impl CatalogDetector {
 }
 
 fn inside_node_modules(path: &Utf8Path) -> bool {
+    if path.file_name() == Some(".cache")
+        && path.parent().and_then(Utf8Path::file_name) == Some("node_modules")
+    {
+        return false;
+    }
     path.parent().is_some_and(|parent| {
         parent
             .ancestors()
