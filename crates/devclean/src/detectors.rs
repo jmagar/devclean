@@ -494,6 +494,13 @@ const RULES: &[Rule] = &[
         marker: Some("generated"),
         protection: None,
     },
+    Rule {
+        family: DetectorFamily::General,
+        basename: "Caches",
+        category: ArtifactCategory::Cache,
+        marker: None,
+        protection: None,
+    },
 ];
 
 const INTERESTS: &[ObservationInterest] = &[
@@ -563,6 +570,7 @@ const INTERESTS: &[ObservationInterest] = &[
     ObservationInterest::Basename("profiles"),
     ObservationInterest::Basename("benchmarks"),
     ObservationInterest::Basename("doc"),
+    ObservationInterest::Basename("Caches"),
     ObservationInterest::Extension("log"),
     ObservationInterest::Extension("zip"),
     ObservationInterest::Extension("tar"),
@@ -656,6 +664,39 @@ impl Detector for CatalogDetector {
 }
 
 impl CatalogDetector {
+    pub fn is_candidate(observation: &Observation) -> bool {
+        match &observation.identity {
+            ResourceIdentity::Filesystem { path } => Self::is_filesystem_candidate(path),
+            ResourceIdentity::Docker { .. } | ResourceIdentity::GitWorktree { .. } => true,
+        }
+    }
+
+    pub fn is_filesystem_candidate(path: &Utf8Path) -> bool {
+        if inside_node_modules(path) {
+            return false;
+        }
+        let basename_match = path
+            .file_name()
+            .is_some_and(|basename| RULES.iter().any(|rule| rule.basename == basename));
+        basename_match
+            || sharded_build(path).is_some()
+            || matches!(
+                path.extension().unwrap_or_default(),
+                "log"
+                    | "zip"
+                    | "tar"
+                    | "gz"
+                    | "xz"
+                    | "7z"
+                    | "db"
+                    | "sqlite"
+                    | "sqlite3"
+                    | "dump"
+                    | "dmp"
+                    | "core"
+            )
+    }
+
     fn detect_one(
         &self,
         observation: &Observation,
@@ -695,18 +736,30 @@ impl CatalogDetector {
                     _ => ArtifactCategory::Unknown,
                 };
                 let unknown = category == ArtifactCategory::Unknown;
-                let mut artifact = external_artifact(
-                    observation,
-                    "docker",
-                    daemon,
-                    &format!("{object_kind}:{id}"),
-                    category,
-                    [
-                        ProbeKind::Rebuildability,
-                        ProbeKind::DockerSnapshot,
-                        ProbeKind::DockerReferences,
-                    ],
-                );
+                let location = format!("{object_kind}:{id}");
+                let mut artifact = if matches!(object_kind.as_str(), "layer" | "build_cache") {
+                    external_artifact(
+                        observation,
+                        "docker",
+                        daemon,
+                        &location,
+                        category,
+                        [
+                            ProbeKind::Rebuildability,
+                            ProbeKind::DockerSnapshot,
+                            ProbeKind::DockerReferences,
+                        ],
+                    )
+                } else {
+                    external_artifact(
+                        observation,
+                        "docker",
+                        daemon,
+                        &location,
+                        category,
+                        [ProbeKind::DockerSnapshot, ProbeKind::DockerReferences],
+                    )
+                };
                 if unknown {
                     artifact.evidence[0].code = EvidenceCode::Ambiguous;
                 }
@@ -717,6 +770,23 @@ impl CatalogDetector {
         let ResourceIdentity::Filesystem { path } = &observation.identity else {
             unreachable!()
         };
+        if let Some((family, marker)) = sharded_build(path) {
+            let marker_present = observation
+                .attributes
+                .get("markers")
+                .is_some_and(|markers| markers.split(',').any(|value| value == marker));
+            if !marker_present {
+                return Ok(None);
+            }
+            return Ok(Some(artifact(
+                observation,
+                path,
+                family,
+                ArtifactCategory::Build,
+                None,
+                true,
+            )));
+        }
         let Some(basename) = path.file_name() else {
             return Ok(None);
         };
@@ -756,12 +826,29 @@ impl CatalogDetector {
             {
                 return Ok(None);
             }
+            let explicitly_owned_cache = observation
+                .attributes
+                .get("approved_cache_root")
+                .is_some_and(|value| value == "true");
+            let rebuildable_owned_cache = observation.attributes.contains_key("project_owner")
+                && metadata_coverage(observation) == CoverageStatus::Complete
+                && observation
+                    .attributes
+                    .get("probe_rebuildability")
+                    .is_some_and(|value| value == "complete");
+            let protection = if (explicitly_owned_cache || rebuildable_owned_cache)
+                && rule.protection == Some(ProtectionSignal::UnknownOwnership)
+            {
+                None
+            } else {
+                rule.protection.clone()
+            };
             return Ok(Some(artifact(
                 observation,
                 path,
                 rule.family,
                 rule.category.clone(),
-                rule.protection.clone(),
+                protection,
                 rule.marker.is_some(),
             )));
         }
@@ -798,6 +885,22 @@ impl CatalogDetector {
             protection,
             false,
         )))
+    }
+}
+
+fn inside_node_modules(path: &Utf8Path) -> bool {
+    path.parent().is_some_and(|parent| {
+        parent
+            .ancestors()
+            .any(|ancestor| ancestor.file_name() == Some("node_modules"))
+    })
+}
+
+fn sharded_build(path: &Utf8Path) -> Option<(DetectorFamily, &'static str)> {
+    match path.parent()?.file_name()? {
+        "incremental" => Some((DetectorFamily::Rust, "Cargo.toml")),
+        "_build" => Some((DetectorFamily::ElixirErlang, "mix.exs")),
+        _ => None,
     }
 }
 

@@ -49,6 +49,31 @@ fn activity_snapshot_filters_to_scope_and_matches_prefixes() {
 }
 
 #[test]
+fn active_ancestor_does_not_protect_an_unopened_descendant() {
+    let pool = pool();
+    let cancellation = AtomicBool::new(false);
+    let snapshot = snapshot_lsof(
+        &CommandRunner,
+        &shell("printf 'p1\\0n/tmp/project\\0'", 1024),
+        &["/tmp/project".into()],
+        &pool,
+        &cancellation,
+    )
+    .unwrap();
+
+    assert!(
+        snapshot
+            .index
+            .matches_prefix(camino::Utf8Path::new("/tmp/project"))
+    );
+    assert!(
+        !snapshot
+            .index
+            .matches_prefix(camino::Utf8Path::new("/tmp/project/target"))
+    );
+}
+
+#[test]
 fn activity_failures_are_typed() {
     let pool = pool();
     let cancellation = AtomicBool::new(false);

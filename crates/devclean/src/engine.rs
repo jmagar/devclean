@@ -3,12 +3,12 @@ use crate::report::{ReportError, ReportStore, ScanReportHeader};
 use crate::spill::FileInodeSpill;
 use devclean_core::{
     BudgetKind, CandidateSink, CoverageMap, CoverageStatus, Detector, DetectorContext,
-    LogicalCandidateId, Observation, ObservationInterest, ObservationRouter, PhysicalAccounting,
-    PhysicalExtent, Policy, ResourceIdentity, RouteInterest, ScanBudget, ScanMetrics, classify,
+    LogicalCandidateId, Observation, PhysicalAccounting, PhysicalExtent, Policy, ResourceIdentity,
+    ScanBudget, ScanMetrics, classify,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, BufWriter, Seek, SeekFrom, Write};
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -41,6 +41,29 @@ pub struct StreamingScanRequest<'a> {
     pub probe_status: CoverageStatus,
     pub cancellation: &'a AtomicBool,
     pub memory_items: usize,
+    /// Filesystem directories are emitted before their descendants, allowing
+    /// recursive accounting to be fused into traversal without replay.
+    pub filesystem_parent_first: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProducerOutcome {
+    pub coverage: CoverageStatus,
+    pub global_estimates_incomplete: bool,
+    /// Filesystem roots whose traversal did not complete. Size estimates for
+    /// candidates below these roots are withheld without penalizing complete
+    /// sibling roots.
+    pub incomplete_roots: BTreeSet<camino::Utf8PathBuf>,
+}
+
+impl From<CoverageStatus> for ProducerOutcome {
+    fn from(coverage: CoverageStatus) -> Self {
+        Self {
+            global_estimates_incomplete: coverage != CoverageStatus::Complete,
+            coverage,
+            incomplete_roots: BTreeSet::new(),
+        }
+    }
 }
 impl ScanEngine<'_> {
     pub fn run(&self, request: ScanRequest<'_>) -> Result<ExitCode, ReportError> {
@@ -52,20 +75,24 @@ impl ScanEngine<'_> {
                 probe_status: request.probe_status,
                 cancellation: request.cancellation,
                 memory_items: request.memory_items,
+                filesystem_parent_first: false,
             },
             |emit| {
                 for value in request.observations {
                     emit(value.clone());
                 }
-                CoverageStatus::Complete
+                ProducerOutcome::from(CoverageStatus::Complete)
             },
         )
     }
-    pub fn run_streaming(
+    pub fn run_streaming<R>(
         &self,
         request: StreamingScanRequest<'_>,
-        producer: impl FnOnce(&mut dyn FnMut(Observation)) -> CoverageStatus,
-    ) -> Result<ExitCode, ReportError> {
+        producer: impl FnOnce(&mut dyn FnMut(Observation)) -> R,
+    ) -> Result<ExitCode, ReportError>
+    where
+        R: Into<ProducerOutcome>,
+    {
         let _lock = self.reports.try_lock()?;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.run_streaming_inner(request, producer)
@@ -75,24 +102,15 @@ impl ScanEngine<'_> {
             Err(_) => Err(ReportError::Internal),
         }
     }
-    fn run_streaming_inner(
+    fn run_streaming_inner<R>(
         &self,
         request: StreamingScanRequest<'_>,
-        producer: impl FnOnce(&mut dyn FnMut(Observation)) -> CoverageStatus,
-    ) -> Result<ExitCode, ReportError> {
+        producer: impl FnOnce(&mut dyn FnMut(Observation)) -> R,
+    ) -> Result<ExitCode, ReportError>
+    where
+        R: Into<ProducerOutcome>,
+    {
         let detector = CatalogDetector::default();
-        let detector_id = detector.descriptor().id;
-        let mut router = ObservationRouter::default();
-        router.register(
-            detector_id,
-            detector.interests().iter().map(|interest| match interest {
-                ObservationInterest::Basename(value) => RouteInterest::Basename((*value).into()),
-                ObservationInterest::Extension(value) => RouteInterest::Extension((*value).into()),
-                ObservationInterest::ResourceKind(value) => {
-                    RouteInterest::ResourceKind((*value).into())
-                }
-            }),
-        );
         let mut metrics = ScanMetrics::default();
         let mut budget = ScanBudget {
             limits: BTreeMap::from([
@@ -113,53 +131,61 @@ impl ScanEngine<'_> {
         let mut physical_estimates_complete = true;
         let mut observation_spool_complete = true;
         let mut observation_spool_bytes = 0_u64;
-        let mut observation_spool = tempfile::tempfile().map_err(|_| ReportError::Internal)?;
-        let mut spool = tempfile::tempfile().map_err(|_| ReportError::Internal)?;
+        let mut candidate_spool_complete = true;
+        let mut candidate_spool_bytes = 0_u64;
+        let mut observation_spool = BufWriter::with_capacity(
+            1024 * 1024,
+            tempfile::tempfile().map_err(|_| ReportError::Internal)?,
+        );
+        let mut spool = BufWriter::with_capacity(
+            256 * 1024,
+            tempfile::tempfile().map_err(|_| ReportError::Internal)?,
+        );
         let mut overall = request.probe_status.clone();
         let mut failed = false;
-        let traversal = {
+        let producer_outcome = {
             let mut emit = |observation: Observation| {
                 metrics.entries_seen = metrics.entries_seen.saturating_add(1);
                 if request.cancellation.load(Ordering::Relaxed) {
                     failed = true;
                     return;
                 }
-                if matches!(observation.identity, ResourceIdentity::Filesystem { .. })
+                if !request.filesystem_parent_first
+                    && matches!(observation.identity, ResourceIdentity::Filesystem { .. })
                     && observation_spool_complete
                 {
-                    match serde_json::to_vec(&observation) {
-                        Ok(encoded)
-                            if observation_spool_bytes
-                                .saturating_add(encoded.len() as u64)
-                                .saturating_add(1)
-                                <= 256 * 1024 * 1024 =>
+                    match FilesystemSpoolRecord::from_observation(&observation) {
+                        Some(record)
+                            if within_byte_budget(
+                                observation_spool_bytes,
+                                record.encoded_len(),
+                                2 * 1024 * 1024 * 1024,
+                            ) =>
                         {
-                            observation_spool_bytes = observation_spool_bytes
-                                .saturating_add(encoded.len() as u64)
-                                .saturating_add(1);
-                            if observation_spool.write_all(&encoded).is_err()
-                                || observation_spool.write_all(b"\n").is_err()
-                            {
+                            observation_spool_bytes =
+                                observation_spool_bytes.saturating_add(record.encoded_len());
+                            if record.write_to(&mut observation_spool).is_err() {
                                 failed = true;
                                 return;
                             }
                         }
-                        Ok(_) => {
+                        Some(_) => {
                             observation_spool_complete = false;
                             logical_estimates_complete = false;
                             physical_estimates_complete = false;
                             overall.join_assign(&CoverageStatus::Partial);
                         }
-                        Err(_) => {
+                        None => {
                             failed = true;
                             return;
                         }
                     }
                 }
-                let routed = router
-                    .route(&observation, &mut metrics)
-                    .iter()
-                    .any(|value| value == detector_id);
+                metrics.route_lookups = metrics.route_lookups.saturating_add(1);
+                let routed = CatalogDetector::is_candidate(&observation);
+                if routed {
+                    metrics.detector_visits = metrics.detector_visits.saturating_add(1);
+                }
                 let one = [observation];
                 let outcome = if routed {
                     detector.detect(DetectorContext {
@@ -208,76 +234,100 @@ impl ScanEngine<'_> {
                         value.physical_bytes_estimate = one[0].allocated_bytes;
                         value.shared_physical_bytes = Some(0);
                     }
-                    if serde_json::to_writer(&mut spool, &value).is_err()
-                        || spool.write_all(b"\n").is_err()
-                    {
-                        failed = true;
+                    if candidate_spool_complete {
+                        match serde_json::to_vec(&value) {
+                            Ok(encoded)
+                                if within_byte_budget(
+                                    candidate_spool_bytes,
+                                    encoded.len() as u64 + 1,
+                                    256 * 1024 * 1024,
+                                ) =>
+                            {
+                                candidate_spool_bytes = candidate_spool_bytes
+                                    .saturating_add(encoded.len() as u64)
+                                    .saturating_add(1);
+                                if spool.write_all(&encoded).is_err()
+                                    || spool.write_all(b"\n").is_err()
+                                {
+                                    failed = true;
+                                }
+                            }
+                            Ok(_) => {
+                                candidate_spool_complete = false;
+                                logical_estimates_complete = false;
+                                physical_estimates_complete = false;
+                                overall.join_assign(&CoverageStatus::Partial);
+                            }
+                            Err(_) => failed = true,
+                        }
+                    }
+                }
+                if request.filesystem_parent_first
+                    && let Some(record) = FilesystemSpoolRecord::from_observation(&one[0])
+                {
+                    match account_record(
+                        record,
+                        &candidate_roots,
+                        &mut logical_bytes,
+                        &mut extent_spool,
+                    ) {
+                        Ok(completeness) => {
+                            logical_estimates_complete &= completeness.logical;
+                            physical_estimates_complete &= completeness.physical;
+                            if !completeness.logical || !completeness.physical {
+                                overall.join_assign(&CoverageStatus::Partial);
+                            }
+                        }
+                        Err(_) => {
+                            physical_estimates_complete = false;
+                            overall.join_assign(&CoverageStatus::Partial);
+                        }
                     }
                 }
             };
-            producer(&mut emit)
+            producer(&mut emit).into()
         };
         if request.cancellation.load(Ordering::Relaxed) {
             return Err(ReportError::Cancelled);
         }
-        if traversal != CoverageStatus::Complete || sink.overflow.is_some() {
+        if sink.overflow.is_some() {
             logical_estimates_complete = false;
             physical_estimates_complete = false;
         }
         observation_spool
             .flush()
             .map_err(|_| ReportError::Internal)?;
+        let mut observation_spool = observation_spool
+            .into_inner()
+            .map_err(|_| ReportError::Internal)?;
         observation_spool
             .seek(SeekFrom::Start(0))
             .map_err(|_| ReportError::Internal)?;
-        for line in BufReader::new(observation_spool).lines() {
-            if request.cancellation.load(Ordering::Relaxed) {
-                return Err(ReportError::Cancelled);
-            }
-            let observation: Observation =
-                serde_json::from_str(&line.map_err(|_| ReportError::Internal)?)
-                    .map_err(|_| ReportError::Internal)?;
-            let ResourceIdentity::Filesystem { path } = &observation.identity else {
-                continue;
-            };
-            let mut owners = path
-                .ancestors()
-                .filter_map(|ancestor| candidate_roots.get(ancestor))
-                .flatten()
-                .cloned()
-                .collect::<Vec<_>>();
-            owners.sort();
-            owners.dedup();
-            if owners.is_empty() {
-                continue;
-            }
-            if let Some(logical) = observation.logical_bytes {
-                for owner in &owners {
-                    let total = logical_bytes.entry(owner.clone()).or_default();
-                    *total = total.saturating_add(logical);
+        if !request.filesystem_parent_first {
+            let mut observation_reader = BufReader::new(observation_spool);
+            while let Some(record) = FilesystemSpoolRecord::read_from(&mut observation_reader)
+                .map_err(|_| ReportError::Internal)?
+            {
+                if request.cancellation.load(Ordering::Relaxed) {
+                    return Err(ReportError::Cancelled);
                 }
-            } else {
-                logical_estimates_complete = false;
-                overall.join_assign(&CoverageStatus::Partial);
-            }
-            match (filesystem_extent(&observation), observation.allocated_bytes) {
-                (Some((device, inode)), Some(allocated)) => {
-                    if extent_spool
-                        .push(ExtentRecord {
-                            device,
-                            inode,
-                            allocated_bytes: allocated,
-                            candidates: owners,
-                        })
-                        .is_err()
-                    {
-                        overall.join_assign(&CoverageStatus::Partial);
-                        physical_estimates_complete = false;
+                match account_record(
+                    record,
+                    &candidate_roots,
+                    &mut logical_bytes,
+                    &mut extent_spool,
+                ) {
+                    Ok(completeness) => {
+                        logical_estimates_complete &= completeness.logical;
+                        physical_estimates_complete &= completeness.physical;
+                        if !completeness.logical || !completeness.physical {
+                            overall.join_assign(&CoverageStatus::Partial);
+                        }
                     }
-                }
-                _ => {
-                    physical_estimates_complete = false;
-                    overall.join_assign(&CoverageStatus::Partial);
+                    Err(_) => {
+                        physical_estimates_complete = false;
+                        overall.join_assign(&CoverageStatus::Partial);
+                    }
                 }
             }
         }
@@ -296,7 +346,7 @@ impl ScanEngine<'_> {
         if sink.overflow.is_some() {
             overall.join_assign(&CoverageStatus::Partial);
         }
-        overall.join_assign(&traversal);
+        overall.join_assign(&producer_outcome.coverage);
         if request.cancellation.load(Ordering::Relaxed) {
             return Err(ReportError::Cancelled);
         }
@@ -304,33 +354,52 @@ impl ScanEngine<'_> {
             return Err(ReportError::UnsafeAuthority);
         }
         spool.flush().map_err(|_| ReportError::Internal)?;
+        let mut spool = spool.into_inner().map_err(|_| ReportError::Internal)?;
         spool
             .seek(SeekFrom::Start(0))
             .map_err(|_| ReportError::Internal)?;
+        let mut warnings = vec![
+            if overall == CoverageStatus::Complete {
+                "scan coverage complete".into()
+            } else {
+                "scan coverage incomplete; inspect candidate coverage fields".into()
+            },
+            format!(
+                "metrics entries={} route_lookups={} detector_visits={} candidates={} candidate_bytes={} inode_entries={} observation_spool_bytes={} candidate_spool_bytes={} unique_bytes={} shared_candidates={} relationships={}",
+                metrics.entries_seen,
+                metrics.route_lookups,
+                metrics.detector_visits,
+                budget.used(BudgetKind::CandidateCount),
+                budget.used(BudgetKind::CandidateBytes),
+                budget.used(BudgetKind::InodeEntries),
+                observation_spool_bytes,
+                candidate_spool_bytes,
+                accounting.unique_bytes,
+                accounting.shared_bytes.len(),
+                relationships
+            ),
+        ];
+        if !observation_spool_complete {
+            warnings.push(
+                "observation_spool_byte_limit reached; filesystem estimates withheld globally"
+                    .into(),
+            );
+        }
+        if !candidate_spool_complete {
+            warnings.push("candidate_spool_byte_limit reached; later candidates omitted".into());
+        }
+        if !physical_estimates_complete {
+            warnings.push(
+                "physical extent accounting incomplete; physical candidate estimates withheld"
+                    .into(),
+            );
+        }
         let header = ScanReportHeader {
             scan_id: request.scan_id.into(),
             safety_fingerprint: request.safety_fingerprint.into(),
             scope_fingerprint: request.scope_fingerprint.into(),
             coverage: overall.clone(),
-            warnings: vec![
-                if overall == CoverageStatus::Complete {
-                    "scan coverage complete".into()
-                } else {
-                    "scan coverage incomplete; inspect candidate coverage fields".into()
-                },
-                format!(
-                    "metrics entries={} route_lookups={} detector_visits={} candidates={} candidate_bytes={} inode_entries={} unique_bytes={} shared_candidates={} relationships={}",
-                    metrics.entries_seen,
-                    metrics.route_lookups,
-                    metrics.detector_visits,
-                    budget.used(BudgetKind::CandidateCount),
-                    budget.used(BudgetKind::CandidateBytes),
-                    budget.used(BudgetKind::InodeEntries),
-                    accounting.unique_bytes,
-                    accounting.shared_bytes.len(),
-                    relationships
-                ),
-            ],
+            warnings,
         };
         let write_result = self.reports.write_streaming_fallible_cancellable(
             &header,
@@ -340,6 +409,8 @@ impl ScanEngine<'_> {
                 accounting: &accounting,
                 logical_estimates_complete,
                 physical_estimates_complete,
+                incomplete_roots: &producer_outcome.incomplete_roots,
+                global_estimates_incomplete: producer_outcome.global_estimates_incomplete,
             },
             request.memory_items,
             request.cancellation,
@@ -375,15 +446,212 @@ fn inode_key(observation: &Observation) -> Option<String> {
     ))
 }
 
+fn within_byte_budget(current: u64, additional: u64, limit: u64) -> bool {
+    current
+        .checked_add(additional)
+        .is_some_and(|total| total <= limit)
+}
+
+#[cfg(test)]
+mod byte_budget_tests {
+    use super::{FilesystemSpoolRecord, within_byte_budget};
+    use devclean_core::{Observation, ResourceFingerprint, ResourceIdentity};
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn byte_budget_is_exact_and_overflow_safe() {
+        assert!(within_byte_budget(7, 3, 10));
+        assert!(!within_byte_budget(8, 3, 10));
+        assert!(!within_byte_budget(u64::MAX, 1, u64::MAX));
+    }
+
+    #[test]
+    fn performance_contract_accounting_spool_is_compact_and_lossless() {
+        let observation = Observation {
+            identity: ResourceIdentity::Filesystem {
+                path: "/tmp/project/target/debug/deps/example".into(),
+            },
+            fingerprint: ResourceFingerprint::filesystem(1, 2, "file", 4096, 3),
+            logical_bytes: Some(4096),
+            allocated_bytes: Some(8192),
+            attributes: BTreeMap::from([
+                ("device".into(), "1".into()),
+                ("inode".into(), "2".into()),
+                ("links".into(), "1".into()),
+                ("probe_filesystem_identity".into(), "complete".into()),
+            ]),
+        };
+        let full = serde_json::to_vec(&observation).unwrap();
+        let compact = FilesystemSpoolRecord::from_observation(&observation).unwrap();
+        let mut encoded = Vec::new();
+        compact.write_to(&mut encoded).unwrap();
+        let decoded = FilesystemSpoolRecord::read_from(&mut encoded.as_slice())
+            .unwrap()
+            .unwrap();
+
+        assert!(encoded.len() * 2 < full.len());
+        assert_eq!(decoded.0.as_str(), "/tmp/project/target/debug/deps/example");
+        assert_eq!(
+            (decoded.1, decoded.2, decoded.3, decoded.4),
+            (Some(4096), Some(8192), Some(1), Some(2))
+        );
+    }
+}
+
 fn filesystem_extent(observation: &Observation) -> Option<(u64, u64)> {
-    Some((
-        observation.attributes.get("device")?.parse().ok()?,
-        observation.attributes.get("inode")?.parse().ok()?,
-    ))
+    match (
+        observation.attributes.get("device"),
+        observation.attributes.get("inode"),
+    ) {
+        (Some(device), Some(inode)) => Some((device.parse().ok()?, inode.parse().ok()?)),
+        _ => observation.fingerprint.extent_identity(),
+    }
+}
+
+/// Minimal binary replay state for recursive size accounting. Full observations
+/// contain a fingerprint and string attribute map that accounting never reads.
+struct FilesystemSpoolRecord(
+    camino::Utf8PathBuf,
+    Option<u64>,
+    Option<u64>,
+    Option<u64>,
+    Option<u64>,
+);
+
+impl FilesystemSpoolRecord {
+    fn from_observation(observation: &Observation) -> Option<Self> {
+        let ResourceIdentity::Filesystem { path } = &observation.identity else {
+            return None;
+        };
+        let extent = filesystem_extent(observation);
+        Some(Self(
+            path.clone(),
+            observation.logical_bytes,
+            observation.allocated_bytes,
+            extent.map(|value| value.0),
+            extent.map(|value| value.1),
+        ))
+    }
+
+    fn encoded_len(&self) -> u64 {
+        let present = [self.1, self.2, self.3, self.4]
+            .into_iter()
+            .filter(Option::is_some)
+            .count() as u64;
+        4_u64
+            .saturating_add(self.0.as_str().len() as u64)
+            .saturating_add(1)
+            .saturating_add(present.saturating_mul(8))
+    }
+
+    fn write_to(&self, output: &mut impl Write) -> std::io::Result<()> {
+        let path = self.0.as_str().as_bytes();
+        let path_len = u32::try_from(path.len()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "spool path too long")
+        })?;
+        output.write_all(&path_len.to_le_bytes())?;
+        output.write_all(path)?;
+        let values = [self.1, self.2, self.3, self.4];
+        let flags = values
+            .iter()
+            .enumerate()
+            .fold(0_u8, |flags, (index, value)| {
+                flags | (u8::from(value.is_some()) << index)
+            });
+        output.write_all(&[flags])?;
+        for value in values.into_iter().flatten() {
+            output.write_all(&value.to_le_bytes())?;
+        }
+        Ok(())
+    }
+
+    fn read_from(input: &mut impl Read) -> std::io::Result<Option<Self>> {
+        let mut path_len = [0_u8; 4];
+        match input.read(&mut path_len[..1])? {
+            0 => return Ok(None),
+            1 => input.read_exact(&mut path_len[1..])?,
+            _ => unreachable!("one-byte read returned more than one byte"),
+        }
+        let path_len = u32::from_le_bytes(path_len) as usize;
+        let mut path = vec![0_u8; path_len];
+        input.read_exact(&mut path)?;
+        let path = String::from_utf8(path)
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "non-UTF-8 path"))?;
+        let mut flags = [0_u8; 1];
+        input.read_exact(&mut flags)?;
+        let mut read_value = |index: usize| -> std::io::Result<Option<u64>> {
+            if flags[0] & (1 << index) == 0 {
+                return Ok(None);
+            }
+            let mut value = [0_u8; 8];
+            input.read_exact(&mut value)?;
+            Ok(Some(u64::from_le_bytes(value)))
+        };
+        Ok(Some(Self(
+            path.into(),
+            read_value(0)?,
+            read_value(1)?,
+            read_value(2)?,
+            read_value(3)?,
+        )))
+    }
+}
+
+#[derive(Clone, Copy)]
+struct AccountingCompleteness {
+    logical: bool,
+    physical: bool,
+}
+
+fn account_record(
+    record: FilesystemSpoolRecord,
+    candidate_roots: &BTreeMap<camino::Utf8PathBuf, Vec<LogicalCandidateId>>,
+    logical_bytes: &mut BTreeMap<LogicalCandidateId, u64>,
+    extent_spool: &mut ExtentSpool,
+) -> std::io::Result<AccountingCompleteness> {
+    let mut owners = record
+        .0
+        .ancestors()
+        .filter_map(|ancestor| candidate_roots.get(ancestor))
+        .flatten()
+        .cloned()
+        .collect::<Vec<_>>();
+    owners.sort();
+    owners.dedup();
+    if owners.is_empty() {
+        return Ok(AccountingCompleteness {
+            logical: true,
+            physical: true,
+        });
+    }
+    let logical = if let Some(bytes) = record.1 {
+        for owner in &owners {
+            let total = logical_bytes.entry(owner.clone()).or_default();
+            *total = total.saturating_add(bytes);
+        }
+        true
+    } else {
+        false
+    };
+    let physical = match (record.3, record.4, record.2) {
+        (Some(device), Some(inode), Some(allocated_bytes)) => {
+            extent_spool.push(ExtentRecord {
+                device,
+                inode,
+                allocated_bytes,
+                candidates: owners,
+            })?;
+            true
+        }
+        _ => false,
+    };
+    Ok(AccountingCompleteness { logical, physical })
 }
 
 const EXTENT_PARTITIONS: usize = 64;
-const EXTENT_PARTITION_BYTES: u64 = 1024 * 1024;
+// 64 partitions bound the physical-accounting spool to 1 GiB total. The scan
+// admission reserve is 3 GiB, leaving room for the candidate/report spools.
+const EXTENT_PARTITION_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Serialize, Deserialize)]
 struct ExtentRecord {
@@ -574,17 +842,23 @@ struct SpoolIter<'a> {
     accounting: &'a PhysicalAccounting,
     logical_estimates_complete: bool,
     physical_estimates_complete: bool,
+    incomplete_roots: &'a BTreeSet<camino::Utf8PathBuf>,
+    global_estimates_incomplete: bool,
 }
 impl Iterator for SpoolIter<'_> {
     type Item = Result<devclean_core::AdvisoryCandidate, ReportError>;
     fn next(&mut self) -> Option<Self::Item> {
         self.lines.next().map(|line| {
             let mut value = decode_spool_line(line)?;
-            if matches!(value.identity, ResourceIdentity::Filesystem { .. }) {
-                if self.logical_estimates_complete {
+            if let ResourceIdentity::Filesystem { path } = &value.identity {
+                let root_complete = !self.global_estimates_incomplete
+                    && !path
+                        .ancestors()
+                        .any(|ancestor| self.incomplete_roots.contains(ancestor));
+                if self.logical_estimates_complete && root_complete {
                     value.logical_bytes_estimate = self.logical_bytes.get(&value.id).copied();
                 }
-                if self.physical_estimates_complete {
+                if self.physical_estimates_complete && root_complete {
                     let additive = self
                         .accounting
                         .additive_bytes

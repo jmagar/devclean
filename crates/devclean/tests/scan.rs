@@ -1,5 +1,6 @@
 use devclean::scan::{
     TraversalCoverage, TraversalOptions, crosses_mount, stream_into_pipeline, stream_observations,
+    stream_roots_parallel,
 };
 use devclean_core::{
     ActivityIndex, ApprovedRootIdentity, BudgetKind, CandidateSink, DiagnosticAggregator,
@@ -17,6 +18,7 @@ fn options() -> TraversalOptions {
     TraversalOptions {
         max_queue: 100,
         max_observations: 1000,
+        shared_observations_remaining: None,
         cross_mounts: false,
         exclusions: vec![],
         scope: None,
@@ -31,6 +33,9 @@ fn options() -> TraversalOptions {
             ]),
         )),
         before_metadata: None,
+        progress: None,
+        deadline: None,
+        emit_roots: false,
     }
 }
 
@@ -41,7 +46,7 @@ fn scoped_options(identity: ApprovedRootIdentity) -> TraversalOptions {
 }
 
 #[test]
-fn traversal_deduplicates_roots_avoids_symlink_loops_and_counts_metadata_once() {
+fn performance_contract_single_walk_deduplicates_roots_and_reads_metadata_once() {
     let tmp = tempfile::tempdir().unwrap();
     let root = camino::Utf8Path::from_path(tmp.path()).unwrap();
     fs::create_dir(root.join("project")).unwrap();
@@ -59,6 +64,100 @@ fn traversal_deduplicates_roots_avoids_symlink_loops_and_counts_metadata_once() 
     assert_eq!(outcome.metrics.entries_seen, 3);
     assert_eq!(outcome.metrics.metadata_reads, outcome.metrics.entries_seen);
     assert_eq!(seen.len(), 3);
+}
+
+#[test]
+fn traversal_stops_at_scan_deadline() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = camino::Utf8Path::from_path(tmp.path()).unwrap();
+    fs::create_dir(root.join("project")).unwrap();
+    fs::write(root.join("project/file"), b"data").unwrap();
+    let mut settings = options();
+    settings.deadline = Some(std::time::Instant::now());
+    let mut diagnostics = DiagnosticAggregator::new(10, 2);
+    let outcome = stream_observations(&[root.to_owned()], &settings, &mut diagnostics, |_| {});
+    assert_eq!(outcome.coverage, TraversalCoverage::Partial);
+    assert!(
+        diagnostics
+            .groups()
+            .keys()
+            .any(|key| key.reason == "elapsed_limit")
+    );
+}
+
+#[test]
+fn performance_contract_parallel_roots_preserve_complete_independent_results() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = camino::Utf8Path::from_path(tmp.path()).unwrap();
+    let roots = [base.join("one"), base.join("two")];
+    for root in &roots {
+        fs::create_dir(root).unwrap();
+        for index in 0..100 {
+            fs::write(root.join(format!("entry-{index}")), b"x").unwrap();
+        }
+    }
+    let mut seen = [0_u64; 2];
+    let outcomes = stream_roots_parallel(&roots, &options(), 2, None, |index, _| seen[index] += 1);
+    assert_eq!(seen, [100, 100]);
+    assert_eq!(outcomes.len(), 2);
+    assert!(
+        outcomes
+            .iter()
+            .all(|outcome| outcome.traversal.coverage == TraversalCoverage::Complete)
+    );
+}
+
+#[test]
+fn performance_contract_parallel_roots_share_one_observation_budget() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = camino::Utf8Path::from_path(tmp.path()).unwrap();
+    let roots = [base.join("one"), base.join("two")];
+    for root in &roots {
+        fs::create_dir(root).unwrap();
+        for index in 0..100 {
+            fs::write(root.join(format!("entry-{index}")), b"x").unwrap();
+        }
+    }
+    let mut settings = options();
+    settings.shared_observations_remaining = Some(Arc::new(std::sync::atomic::AtomicU64::new(150)));
+    let outcomes = stream_roots_parallel(&roots, &settings, 2, None, |_, _| {});
+    assert_eq!(
+        outcomes
+            .iter()
+            .map(|outcome| outcome.traversal.metrics.entries_seen)
+            .sum::<u64>(),
+        150
+    );
+    assert!(
+        outcomes
+            .iter()
+            .any(|outcome| outcome.traversal.coverage == TraversalCoverage::Partial)
+    );
+}
+
+#[test]
+fn traversal_can_emit_an_approved_root_for_recursive_cache_accounting() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = camino::Utf8Path::from_path(tmp.path()).unwrap();
+    fs::write(root.join("entry"), b"data").unwrap();
+    let mut settings = options();
+    settings.emit_roots = true;
+    let mut seen = Vec::new();
+    let mut diagnostics = DiagnosticAggregator::new(10, 2);
+
+    let outcome = stream_observations(
+        &[root.to_owned()],
+        &settings,
+        &mut diagnostics,
+        |observation| seen.push(observation.identity),
+    );
+
+    assert_eq!(outcome.coverage, TraversalCoverage::Complete);
+    assert_eq!(outcome.metrics.entries_seen, 2);
+    assert!(matches!(
+        &seen[0],
+        ResourceIdentity::Filesystem { path } if path == root
+    ));
 }
 
 #[test]
@@ -80,14 +179,14 @@ fn traversal_reports_limits_cancellation_hardlinks_and_sparse_allocation() {
     });
     assert_eq!(outcome.coverage, TraversalCoverage::Partial);
     assert!(outcome.metrics.queue_high_water <= 1);
-    let inode = fs::metadata(root.join("original"))
-        .unwrap()
-        .ino()
-        .to_string();
+    let inode = fs::metadata(root.join("original")).unwrap().ino();
     assert_eq!(
         observations
             .iter()
-            .filter(|value| value.attributes.get("inode") == Some(&inode))
+            .filter(|value| value
+                .fingerprint
+                .extent_identity()
+                .is_some_and(|(_, value)| value == inode))
             .count(),
         2
     );

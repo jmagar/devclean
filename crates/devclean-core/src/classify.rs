@@ -45,11 +45,16 @@ impl SafetyProof {
                 ProbeKind::GitRegistration,
                 ProbeKind::GitReachability,
             ]),
-            ResourceIdentity::Docker { .. } => required.0.extend([
-                ProbeKind::Rebuildability,
-                ProbeKind::DockerSnapshot,
-                ProbeKind::DockerReferences,
-            ]),
+            ResourceIdentity::Docker {
+                ref object_kind, ..
+            } => {
+                required
+                    .0
+                    .extend([ProbeKind::DockerSnapshot, ProbeKind::DockerReferences]);
+                if matches!(object_kind.as_str(), "layer" | "build_cache" | "cache") {
+                    required.0.insert(ProbeKind::Rebuildability);
+                }
+            }
         }
         if artifact
             .evidence

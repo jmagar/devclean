@@ -470,6 +470,12 @@ pub fn render_summary(report: &ScanReportV1, max_rows: usize, tty: bool) -> Stri
         safe_terminal_bounded(&report.scan_id, 128),
         report.coverage
     );
+    let (safe_candidates, safe_physical_bytes, safe_unknown) =
+        non_overlapping_safe_physical(&report.candidates);
+    out.push_str(&format!(
+        "safe reclaimable estimate\tphysical={}\tcandidates={}\tunknown={}\n",
+        safe_physical_bytes, safe_candidates, safe_unknown
+    ));
     for candidate in report.candidates.iter().take(max_rows) {
         let location = match &candidate.identity {
             devclean_core::ResourceIdentity::Filesystem { path } => path.as_str(),
@@ -520,6 +526,60 @@ pub fn render_summary(report: &ScanReportV1, max_rows: usize, tty: bool) -> Stri
         out.push_str("interactive: disabled in inventory v1\n");
     }
     out
+}
+
+fn non_overlapping_safe_physical(candidates: &[AdvisoryCandidate]) -> (usize, u64, usize) {
+    let mut filesystem = candidates
+        .iter()
+        .filter(|candidate| candidate.tier == Tier::Safe)
+        .filter_map(|candidate| match &candidate.identity {
+            devclean_core::ResourceIdentity::Filesystem { path } => {
+                Some((path, candidate.physical_bytes_estimate))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    filesystem.sort_by(|(left, _), (right, _)| {
+        left.components()
+            .count()
+            .cmp(&right.components().count())
+            .then_with(|| left.cmp(right))
+    });
+    let mut selected = std::collections::BTreeSet::<Utf8PathBuf>::new();
+    let mut count = 0_usize;
+    let mut bytes = 0_u64;
+    let mut unknown = 0_usize;
+    for (path, estimate) in filesystem {
+        if path
+            .ancestors()
+            .skip(1)
+            .any(|ancestor| selected.contains(ancestor))
+        {
+            continue;
+        }
+        let Some(estimate) = estimate else {
+            unknown = unknown.saturating_add(1);
+            continue;
+        };
+        selected.insert(path.clone());
+        count = count.saturating_add(1);
+        bytes = bytes.saturating_add(estimate);
+    }
+    for candidate in candidates.iter().filter(|candidate| {
+        candidate.tier == Tier::Safe
+            && !matches!(
+                &candidate.identity,
+                devclean_core::ResourceIdentity::Filesystem { .. }
+            )
+    }) {
+        if let Some(estimate) = candidate.physical_bytes_estimate {
+            count = count.saturating_add(1);
+            bytes = bytes.saturating_add(estimate);
+        } else {
+            unknown = unknown.saturating_add(1);
+        }
+    }
+    (count, bytes, unknown)
 }
 
 fn safe_terminal_bounded(value: &str, max_chars: usize) -> String {

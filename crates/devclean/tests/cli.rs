@@ -5,6 +5,21 @@ fn command() -> Command {
 }
 
 #[test]
+fn macos_init_without_store_uses_home_default() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir_in(std::env::var("HOME").unwrap()).unwrap();
+    std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let result = command()
+        .args(["init", "--macos"])
+        .env("HOME", temp.path())
+        .output()
+        .unwrap();
+    assert_eq!(result.status.code(), Some(0), "{:?}", result.stderr);
+    assert!(temp.path().join(".devclean/config.toml").is_file());
+}
+
+#[test]
 fn cli_rejects_unsafe_config_files_without_blocking() {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;

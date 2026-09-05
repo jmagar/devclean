@@ -14,6 +14,8 @@ pub struct Config {
     pub docker: Option<DockerScope>,
     #[serde(default)]
     pub presentation: Presentation,
+    #[serde(default)]
+    pub limits: ScanLimits,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -51,6 +53,37 @@ pub struct Presentation {
     pub terminal_rows: usize,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScanLimits {
+    #[serde(default = "default_max_observations")]
+    pub max_observations: u64,
+    #[serde(default = "default_max_elapsed_seconds")]
+    pub max_elapsed_seconds: u64,
+    #[serde(default = "default_min_free_bytes")]
+    pub min_free_bytes: u64,
+}
+
+impl Default for ScanLimits {
+    fn default() -> Self {
+        Self {
+            max_observations: default_max_observations(),
+            max_elapsed_seconds: default_max_elapsed_seconds(),
+            min_free_bytes: default_min_free_bytes(),
+        }
+    }
+}
+
+const fn default_max_observations() -> u64 {
+    50_000_000
+}
+const fn default_max_elapsed_seconds() -> u64 {
+    900
+}
+const fn default_min_free_bytes() -> u64 {
+    3 * 1024 * 1024 * 1024
+}
+
 impl Config {
     pub fn parse(input: &str) -> Result<Self, toml::de::Error> {
         toml::from_str(input)
@@ -63,6 +96,11 @@ impl Config {
             self.docker
                 .as_ref()
                 .map(|d| (&d.context, &d.endpoint, &d.engine_id)),
+            (
+                self.limits.max_observations,
+                self.limits.max_elapsed_seconds,
+                self.limits.min_free_bytes,
+            ),
         ))
         .expect("serializable config");
         SafetyFingerprint(blake3::hash(material.as_bytes()).to_hex().to_string())

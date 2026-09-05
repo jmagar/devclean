@@ -3,7 +3,7 @@ use devclean::engine::*;
 use devclean::private_store::PrivateStore;
 use devclean::report::{ReportError, ReportStore};
 use devclean_core::{CoverageStatus, Observation, ResourceFingerprint, ResourceIdentity, Tier};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::MetadataExt;
 use std::process::Command;
 use std::sync::atomic::AtomicBool;
@@ -132,7 +132,7 @@ fn compact_all_family_corpus_persists_exact_classification() {
             .iter()
             .filter(|v| v.tier == Tier::Safe)
             .count(),
-        5
+        6
     );
     assert_eq!(
         report
@@ -140,7 +140,7 @@ fn compact_all_family_corpus_persists_exact_classification() {
             .iter()
             .filter(|v| v.tier == Tier::Protected)
             .count(),
-        6
+        5
     );
     assert_eq!(
         report
@@ -550,6 +550,7 @@ fn partial_producer_withholds_physical_estimates_instead_of_reporting_zero() {
                 probe_status: CoverageStatus::Complete,
                 cancellation: &AtomicBool::new(false),
                 memory_items: 2,
+                filesystem_parent_first: false,
             },
             |emit| {
                 emit(observation("/p/target", "Cargo.toml"));
@@ -562,6 +563,53 @@ fn partial_producer_withholds_physical_estimates_instead_of_reporting_zero() {
     assert_eq!(candidate.logical_bytes_estimate, None);
     assert_eq!(candidate.physical_bytes_estimate, None);
     assert_eq!(candidate.shared_physical_bytes, None);
+}
+
+#[test]
+fn partial_root_does_not_withhold_complete_sibling_estimates() {
+    let (_temp, reports) = store();
+    let engine = ScanEngine {
+        reports: &reports,
+        policy: Default::default(),
+    };
+    let code = engine
+        .run_streaming(
+            StreamingScanRequest {
+                scan_id: "root-local-accounting",
+                safety_fingerprint: "safe",
+                scope_fingerprint: "scope",
+                probe_status: CoverageStatus::Complete,
+                cancellation: &AtomicBool::new(false),
+                memory_items: 4,
+                filesystem_parent_first: false,
+            },
+            |emit| {
+                emit(observation("/good/target", "Cargo.toml"));
+                emit(observation("/bad/target", "Cargo.toml"));
+                ProducerOutcome {
+                    coverage: CoverageStatus::Partial,
+                    incomplete_roots: BTreeSet::from([Utf8PathBuf::from("/bad")]),
+                    global_estimates_incomplete: false,
+                }
+            },
+        )
+        .unwrap();
+    assert_eq!(code, ExitCode::Incomplete);
+    let report = reports.read("root-local-accounting").unwrap();
+    let good = report
+        .candidates
+        .iter()
+        .find(|candidate| matches!(&candidate.identity, ResourceIdentity::Filesystem { path } if path == "/good/target"))
+        .unwrap();
+    let bad = report
+        .candidates
+        .iter()
+        .find(|candidate| matches!(&candidate.identity, ResourceIdentity::Filesystem { path } if path == "/bad/target"))
+        .unwrap();
+    assert_eq!(good.logical_bytes_estimate, Some(1));
+    assert_eq!(good.physical_bytes_estimate, Some(1));
+    assert_eq!(bad.logical_bytes_estimate, None);
+    assert_eq!(bad.physical_bytes_estimate, None);
 }
 
 #[test]
@@ -622,10 +670,11 @@ fn extent_partition_overflow_fails_closed_without_partial_estimates() {
                 probe_status: CoverageStatus::Complete,
                 cancellation: &AtomicBool::new(false),
                 memory_items: 2,
+                filesystem_parent_first: false,
             },
             |emit| {
                 emit(observation("/p/target", "Cargo.toml"));
-                for index in 0..15_000 {
+                for index in 0..250_000 {
                     let mut child = observation(&format!("/p/target/file-{index}"), "");
                     child.attributes.insert("device".into(), "7".into());
                     child.attributes.insert("inode".into(), "9".into());
@@ -636,7 +685,14 @@ fn extent_partition_overflow_fails_closed_without_partial_estimates() {
         )
         .unwrap();
     assert_eq!(code, ExitCode::Incomplete);
-    let candidate = &reports.read("extent-spill-overflow").unwrap().candidates[0];
+    let report = reports.read("extent-spill-overflow").unwrap();
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("physical extent accounting incomplete"))
+    );
+    let candidate = &report.candidates[0];
     assert_eq!(candidate.physical_bytes_estimate, None);
     assert_eq!(candidate.shared_physical_bytes, None);
 }
@@ -659,6 +715,7 @@ fn million_unique_observations_remain_spill_bounded() {
                 probe_status: CoverageStatus::Complete,
                 cancellation: &AtomicBool::new(false),
                 memory_items: 2,
+                filesystem_parent_first: false,
             },
             |emit| {
                 emit(observation("/p/target", "Cargo.toml"));
@@ -722,6 +779,7 @@ fn cancellation_interrupts_recursive_descendant_attribution_without_a_report() {
             probe_status: CoverageStatus::Complete,
             cancellation: &cancellation,
             memory_items: 2,
+            filesystem_parent_first: false,
         },
         |emit| {
             emit(observation("/p/target", "Cargo.toml"));
@@ -762,8 +820,9 @@ fn producer_panic_preserves_previous_report_at_same_scan_id() {
             probe_status: CoverageStatus::Complete,
             cancellation: &AtomicBool::new(false),
             memory_items: 2,
+            filesystem_parent_first: false,
         },
-        |_emit| panic!("injected producer panic"),
+        |_emit| -> CoverageStatus { panic!("injected producer panic") },
     );
     assert!(matches!(result, Err(ReportError::Internal)));
     let after = reports.read("stable").unwrap();

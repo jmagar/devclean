@@ -198,13 +198,10 @@ impl ActivityIndex {
         self.active.insert(path);
     }
     pub fn matches_prefix(&self, path: &Utf8Path) -> bool {
-        path.ancestors()
-            .any(|ancestor| self.active.contains(ancestor))
-            || self
-                .active
-                .range(path.to_owned()..)
-                .next()
-                .is_some_and(|active| active.starts_with(path))
+        self.active
+            .range(path.to_owned()..)
+            .next()
+            .is_some_and(|active| active.starts_with(path))
     }
 }
 
