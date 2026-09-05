@@ -7,6 +7,39 @@ they were classified, and writes private, versioned JSON reports.
 The current release is intentionally read-only. It does not delete, prune,
 trash, or otherwise modify detected resources.
 
+## Desktop app
+
+Devclean includes a native, GPU-rendered GPUI desktop app for macOS. It keeps
+the scanner's conservative safety boundary while making the inventory easy to
+configure and explore:
+
+- add or remove explicitly approved scan locations with the native folder picker
+- run scans in the background without blocking the interface
+- filter findings by Safe, Review, Protected, or Unknown tier
+- inspect size estimates, positive evidence, and protection signals
+- reopen the latest local report and export a privacy-preserving redacted copy
+
+Build both the scanner and app, then launch the app:
+
+```sh
+cargo build --workspace
+cargo run -p devclean-gui --bin devclean-app
+```
+
+To create a normal macOS application bundle:
+
+```sh
+./scripts/package-macos.sh release
+open target/release/Devclean.app
+```
+
+The app expects the `devclean` scanner beside `devclean-app`. For custom bundles,
+set `DEVCLEAN_BIN` to an absolute scanner path. App data is stored privately in
+`~/Library/Application Support/devclean` with owner-only permissions.
+
+GPUI uses Metal on macOS. The `runtime_shaders` feature keeps development builds
+working with Command Line Tools alone; a full Xcode installation is not required.
+
 ## Detectors
 
 - Docker images, containers, volumes, networks, layers, and build cache

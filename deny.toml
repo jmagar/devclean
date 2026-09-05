@@ -1,9 +1,31 @@
 [advisories]
 version = 2
 yanked = "deny"
+# Current GPUI 0.2.2 transitives. These are maintenance-status advisories, not
+# known vulnerabilities, and have no upgrade path until GPUI replaces them.
+ignore = [
+  "RUSTSEC-2024-0384", # instant via gpui_util
+  "RUSTSEC-2024-0436", # paste via Metal/image crates
+  "RUSTSEC-2025-0052", # async-std via gpui_http_client
+  "RUSTSEC-2025-0134", # rustls-pemfile via gpui_http_client
+  "RUSTSEC-2026-0173", # proc-macro-error2 via stacksafe
+  "RUSTSEC-2026-0192", # ttf-parser via GPUI font stacks
+  "RUSTSEC-2026-0206", # rustybuzz via GPUI font/SVG stacks
+]
 
 [licenses]
 version = 2
 confidence-threshold = 0.8
-allow = ["Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "MIT", "Unicode-3.0", "Zlib"]
-
+allow = [
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "CC0-1.0",
+  "ISC",
+  "MIT",
+  "MPL-2.0",
+  "NCSA",
+  "Unicode-3.0",
+  "Zlib",
+]
