@@ -10,6 +10,22 @@ pub struct PrivateStore {
 }
 
 impl PrivateStore {
+    pub fn member_names(&self) -> Result<Vec<String>, StoreError> {
+        validate(&self.root, true)?;
+        let mut names = Vec::new();
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let path = self.member(&name)?;
+            if validate(&path, false).is_ok() {
+                names.push(name);
+            }
+        }
+        Ok(names)
+    }
+
     pub fn temporary_child(&self) -> Result<(tempfile::TempDir, Self), StoreError> {
         validate(&self.root, true)?;
         let directory = tempfile::Builder::new()
@@ -134,7 +150,11 @@ impl PrivateStore {
         write: impl FnOnce(&mut fs::File) -> Result<(), StoreError>,
     ) -> Result<Utf8PathBuf, StoreError> {
         let path = self.member(name)?;
-        let temp_name = format!(".{name}.{}.tmp", std::process::id());
+        let temp_name = format!(
+            ".{name}.{}.{}.tmp",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        );
         let temp = self.member(&temp_name)?;
         let mut file = OpenOptions::new()
             .write(true)

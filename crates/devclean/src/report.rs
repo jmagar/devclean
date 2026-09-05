@@ -69,6 +69,33 @@ pub struct ReportStore {
     max_bytes: u64,
 }
 impl ReportStore {
+    pub fn latest_valid_report_id(&self) -> Result<Option<String>, ReportError> {
+        let mut ids = self
+            .store
+            .member_names()?
+            .into_iter()
+            .filter_map(|name| full_report_id(&name).map(str::to_owned))
+            .collect::<Vec<_>>();
+        ids.sort_unstable_by(|left, right| right.cmp(left));
+        for id in ids {
+            if self.stream_summary(&id).is_ok() {
+                return Ok(Some(id));
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn valid_report_ids(&self) -> Result<Vec<String>, ReportError> {
+        let mut ids = self
+            .store
+            .member_names()?
+            .into_iter()
+            .filter_map(|name| full_report_id(&name).map(str::to_owned))
+            .filter(|id| self.stream_summary(id).is_ok())
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        Ok(ids)
+    }
     pub fn temporary_store(&self) -> Result<(tempfile::TempDir, PrivateStore), ReportError> {
         self.store.temporary_child().map_err(ReportError::Store)
     }
@@ -240,6 +267,12 @@ impl ReportStore {
             }
         }
     }
+}
+
+pub fn full_report_id(name: &str) -> Option<&str> {
+    let id = name.strip_prefix("scan-")?.strip_suffix(".json")?;
+    (!id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()))
+        .then_some(name.strip_suffix(".json")?)
 }
 
 fn inspect_reader(
@@ -470,6 +503,12 @@ pub fn render_summary(report: &ScanReportV1, max_rows: usize, tty: bool) -> Stri
         safe_terminal_bounded(&report.scan_id, 128),
         report.coverage
     );
+    let (safe_candidates, safe_physical_bytes, safe_unknown) =
+        non_overlapping_safe_physical(&report.candidates);
+    out.push_str(&format!(
+        "safe reclaimable estimate\tphysical={}\tcandidates={}\tunknown={}\n",
+        safe_physical_bytes, safe_candidates, safe_unknown
+    ));
     for candidate in report.candidates.iter().take(max_rows) {
         let location = match &candidate.identity {
             devclean_core::ResourceIdentity::Filesystem { path } => path.as_str(),
@@ -522,11 +561,66 @@ pub fn render_summary(report: &ScanReportV1, max_rows: usize, tty: bool) -> Stri
     out
 }
 
+fn non_overlapping_safe_physical(candidates: &[AdvisoryCandidate]) -> (usize, u64, usize) {
+    let mut filesystem = candidates
+        .iter()
+        .filter(|candidate| candidate.tier == Tier::Safe)
+        .filter_map(|candidate| match &candidate.identity {
+            devclean_core::ResourceIdentity::Filesystem { path } => {
+                Some((path, candidate.physical_bytes_estimate))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    filesystem.sort_by(|(left, _), (right, _)| {
+        left.components()
+            .count()
+            .cmp(&right.components().count())
+            .then_with(|| left.cmp(right))
+    });
+    let mut selected = std::collections::BTreeSet::<Utf8PathBuf>::new();
+    let mut count = 0_usize;
+    let mut bytes = 0_u64;
+    let mut unknown = 0_usize;
+    for (path, estimate) in filesystem {
+        if path
+            .ancestors()
+            .skip(1)
+            .any(|ancestor| selected.contains(ancestor))
+        {
+            continue;
+        }
+        let Some(estimate) = estimate else {
+            unknown = unknown.saturating_add(1);
+            continue;
+        };
+        selected.insert(path.clone());
+        count = count.saturating_add(1);
+        bytes = bytes.saturating_add(estimate);
+    }
+    for candidate in candidates.iter().filter(|candidate| {
+        candidate.tier == Tier::Safe
+            && !matches!(
+                &candidate.identity,
+                devclean_core::ResourceIdentity::Filesystem { .. }
+            )
+    }) {
+        if let Some(estimate) = candidate.physical_bytes_estimate {
+            count = count.saturating_add(1);
+            bytes = bytes.saturating_add(estimate);
+        } else {
+            unknown = unknown.saturating_add(1);
+        }
+    }
+    (count, bytes, unknown)
+}
+
 fn safe_terminal_bounded(value: &str, max_chars: usize) -> String {
     safe_terminal(&value.chars().take(max_chars).collect::<String>())
 }
 
 pub fn write_redacted(report: &ScanReportV1, mut writer: impl Write) -> Result<(), ReportError> {
+    let export_salt = uuid::Uuid::new_v4();
     #[derive(Serialize)]
     struct Export<'a> {
         schema_version: u32,
@@ -547,8 +641,10 @@ pub fn write_redacted(report: &ScanReportV1, mut writer: impl Write) -> Result<(
         .map(|value| Redacted {
             id: format!(
                 "candidate-{}",
-                &blake3::hash(format!("devclean-redacted-v1\0{}", value.id.0).as_bytes()).to_hex()
-                    [..16]
+                &blake3::hash(
+                    format!("devclean-redacted-v2\0{export_salt}\0{}", value.id.0).as_bytes(),
+                )
+                .to_hex()[..16]
             ),
             tier: value.tier,
             protections: value

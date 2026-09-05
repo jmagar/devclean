@@ -32,6 +32,19 @@ impl ResourceFingerprint {
         let material = format!("{namespace}\0{identity}");
         Self(blake3::hash(material.as_bytes()).to_hex().to_string())
     }
+
+    /// Traversal-only identity used for ordinary filesystem entries that are
+    /// never exposed as cleanup candidates. Candidate fingerprints continue to
+    /// include kind, size, and modification time.
+    pub fn filesystem_extent(device: u64, inode: u64) -> Self {
+        Self(format!("extent:{device}:{inode}"))
+    }
+
+    pub fn extent_identity(&self) -> Option<(u64, u64)> {
+        let value = self.0.strip_prefix("extent:")?;
+        let (device, inode) = value.split_once(':')?;
+        Some((device.parse().ok()?, inode.parse().ok()?))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]

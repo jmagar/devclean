@@ -114,6 +114,125 @@ fn markerless_cache_and_log_names_require_known_ownership() {
 }
 
 #[test]
+fn nested_node_modules_contents_are_not_independent_cleanup_candidates() {
+    let detector = CatalogDetector::default();
+    for path in [
+        "/work/project/node_modules/pkg/dist",
+        "/work/project/node_modules/.pnpm/pkg/node_modules",
+        "/work/project/node_modules/pkg/cache.log",
+    ] {
+        let value = observation(path, "package.json");
+        assert!(!CatalogDetector::is_filesystem_candidate(
+            camino::Utf8Path::new(path)
+        ));
+        assert!(
+            detector
+                .detect(DetectorContext {
+                    observations: &[value],
+                    artifact_limit: 10,
+                })
+                .artifacts
+                .is_empty(),
+            "nested dependency artifact escaped: {path}"
+        );
+    }
+}
+
+#[test]
+fn explicitly_approved_cache_roots_do_not_keep_unknown_ownership_protection() {
+    let detector = CatalogDetector::default();
+    for path in [
+        "/home/user/.npm",
+        "/home/user/.cargo/registry",
+        "/home/user/Library/Caches",
+    ] {
+        let mut value = observation(path, "");
+        value
+            .attributes
+            .insert("approved_cache_root".into(), "true".into());
+        let outcome = detector.detect(DetectorContext {
+            observations: &[value],
+            artifact_limit: 10,
+        });
+        assert_eq!(outcome.artifacts.len(), 1, "{path}");
+        assert!(
+            !outcome.artifacts[0]
+                .protection_signals
+                .contains(&ProtectionSignal::UnknownOwnership),
+            "{path}"
+        );
+    }
+}
+
+#[test]
+fn rebuildable_project_caches_do_not_keep_unknown_ownership_protection() {
+    let detector = CatalogDetector::default();
+    let mut value = observation("/work/project/.cache", "Cargo.toml");
+    value
+        .attributes
+        .insert("probe_rebuildability".into(), "complete".into());
+    let outcome = detector.detect(DetectorContext {
+        observations: &[value],
+        artifact_limit: 10,
+    });
+
+    assert_eq!(outcome.artifacts.len(), 1);
+    assert!(
+        !outcome.artifacts[0]
+            .protection_signals
+            .contains(&ProtectionSignal::UnknownOwnership)
+    );
+}
+
+#[test]
+fn unproven_project_caches_remain_unknown_ownership() {
+    let detector = CatalogDetector::default();
+    let value = observation("/work/project/.cache", "Cargo.toml");
+    let outcome = detector.detect(DetectorContext {
+        observations: &[value],
+        artifact_limit: 10,
+    });
+
+    assert_eq!(outcome.artifacts.len(), 1);
+    assert!(
+        outcome.artifacts[0]
+            .protection_signals
+            .contains(&ProtectionSignal::UnknownOwnership)
+    );
+}
+
+#[test]
+fn unreferenced_docker_images_require_reference_evidence_but_not_rebuildability() {
+    let detector = CatalogDetector::default();
+    let value = devclean_core::Observation {
+        identity: ResourceIdentity::Docker {
+            daemon: "engine".into(),
+            object_kind: "image".into(),
+            id: "sha256:fixture".into(),
+        },
+        fingerprint: ResourceFingerprint::opaque("docker", "fixture"),
+        logical_bytes: Some(1024),
+        allocated_bytes: Some(1024),
+        attributes: BTreeMap::from([
+            ("probe_docker_snapshot".into(), "complete".into()),
+            ("probe_docker_references".into(), "complete".into()),
+            ("probe_rebuildability".into(), "unknown".into()),
+        ]),
+    };
+    let outcome = detector.detect(DetectorContext {
+        observations: &[value],
+        artifact_limit: 10,
+    });
+    assert_eq!(outcome.artifacts.len(), 1);
+    assert!(
+        !outcome.artifacts[0]
+            .required_probes
+            .0
+            .contains(&devclean_core::ProbeKind::Rebuildability)
+    );
+}
+
+#[test]
 fn metadata_failure_is_visible_and_requires_metadata_probe() {
     let detector = CatalogDetector::default();
     let mut value = observation("/p/target", "Cargo.toml");
@@ -205,6 +324,41 @@ fn expanded_tool_cache_catalog_has_positive_coverage() {
         });
         assert_eq!(outcome.artifacts.len(), 1, "missing {path}");
     }
+}
+
+#[test]
+fn build_shards_are_independent_candidates_with_activity_fences() {
+    let detector = CatalogDetector::default();
+    let mut active = observation(
+        "/work/project/target/debug/incremental/live-crate",
+        "Cargo.toml",
+    );
+    active.attributes.insert("active".into(), "true".into());
+    active.attributes.insert("open".into(), "true".into());
+    let idle = observation(
+        "/work/project/target/debug/incremental/idle-crate",
+        "Cargo.toml",
+    );
+    let mix = observation("/work/project/_build/test", "mix.exs");
+    let values = [active, idle, mix];
+    let outcome = detector.detect(DetectorContext {
+        observations: &values,
+        artifact_limit: 10,
+    });
+
+    assert_eq!(outcome.artifacts.len(), 3);
+    assert!(
+        outcome.artifacts[0]
+            .protection_signals
+            .contains(&ProtectionSignal::Active)
+    );
+    assert!(
+        outcome.artifacts[0]
+            .protection_signals
+            .contains(&ProtectionSignal::OpenFile)
+    );
+    assert!(outcome.artifacts[1].protection_signals.is_empty());
+    assert!(outcome.artifacts[2].protection_signals.is_empty());
 }
 
 #[test]

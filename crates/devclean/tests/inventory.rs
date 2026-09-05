@@ -588,8 +588,10 @@ fn production_docker_backend_is_get_only_bounded_and_parses_every_kind() {
         context: "test".into(),
         engine_id: "engine".into(),
     };
+    // Keep the fixture bounded without making optimized test runs depend on a
+    // one-second scheduler window on loaded CI hosts.
     let mut backend =
-        DockerUnixBackend::new(Duration::from_secs(1), Duration::from_secs(1), 64 * 1024);
+        DockerUnixBackend::new(Duration::from_secs(2), Duration::from_secs(5), 64 * 1024);
     let result = DockerInventoryCache::default().get_or_collect(
         key.clone(),
         &mut backend,

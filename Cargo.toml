@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/devclean-core", "crates/devclean"]
+members = ["crates/devclean-core", "crates/devclean", "crates/devclean-gui"]
 resolver = "3"
 
 [workspace.package]
@@ -14,8 +14,9 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.9"
 thiserror = "2.0"
-uuid = { version = "1.18", features = ["v5", "serde"] }
+uuid = { version = "1.18", features = ["v4", "v5", "serde"] }
 tempfile = "3.23"
 libc = "0.2"
 socket2 = "0.6"
+rayon = "1.11"
 schemars = { version = "1.0", features = ["uuid1"] }

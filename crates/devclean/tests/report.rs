@@ -64,6 +64,35 @@ fn report_round_trip_is_atomic_private_and_strict() {
 }
 
 #[test]
+fn summary_reports_non_overlapping_safe_physical_estimate() {
+    let mut value = report("safe-summary");
+    let prototype = &value.candidates[0];
+    let mut parent = prototype.clone();
+    parent.id = LogicalCandidateId::derive("test", "owner", "parent");
+    parent.identity = ResourceIdentity::Filesystem {
+        path: "/tmp/project/target".into(),
+    };
+    parent.tier = Tier::Safe;
+    parent.physical_bytes_estimate = Some(100);
+    let mut child = parent.clone();
+    child.id = LogicalCandidateId::derive("test", "owner", "child");
+    child.identity = ResourceIdentity::Filesystem {
+        path: "/tmp/project/target/debug".into(),
+    };
+    child.physical_bytes_estimate = Some(75);
+    let mut sibling = parent.clone();
+    sibling.id = LogicalCandidateId::derive("test", "owner", "sibling");
+    sibling.identity = ResourceIdentity::Filesystem {
+        path: "/tmp/project/.cache".into(),
+    };
+    sibling.physical_bytes_estimate = Some(25);
+    value.candidates = vec![child, sibling, parent];
+
+    let rendered = render_summary(&value, 0, false);
+    assert!(rendered.contains("safe reclaimable estimate\tphysical=125\tcandidates=2\tunknown=0"));
+}
+
+#[test]
 fn fallible_spool_errors_are_typed_and_preserve_prior_report() {
     let temp = tempfile::tempdir().unwrap();
     let root = Utf8PathBuf::from_path_buf(std::fs::canonicalize(temp.path()).unwrap())
@@ -237,7 +266,10 @@ fn redaction_and_terminal_output_sanitize_untrusted_protections_stably() {
     let mut b = Vec::new();
     write_redacted(&first, &mut a).unwrap();
     write_redacted(&second, &mut b).unwrap();
-    assert_eq!(a, b);
+    assert_ne!(
+        a, b,
+        "separate exports must not be correlatable by candidate id"
+    );
     let export = String::from_utf8(a).unwrap();
     assert!(export.contains("active"));
     assert!(!export.contains("secret"));
