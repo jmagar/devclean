@@ -9,3 +9,4 @@
 /docs/acceptance/macos-docker-qualification.toml
 /docs/acceptance/macos-filesystem-git-qualification.toml
 /docs/acceptance/macos-read-only.md
+worktrees/
